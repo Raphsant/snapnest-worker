@@ -7,14 +7,20 @@ the job finishes, success or failure.
 
 from __future__ import annotations
 
+import json
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from mypy_boto3_s3.client import S3Client
+
+# Small JSON scratch file used to pass values (e.g. output S3 keys) between the
+# stages of a single job run. It lives inside the (ephemeral) job directory.
+STATE_FILENAME = "state.json"
 
 
 @dataclass
@@ -59,3 +65,19 @@ class Workspace:
         """Upload a local file to S3 under the given key."""
 
         self.s3.upload_file(str(local_path), self.bucket, s3_key)
+
+    def read_state(self) -> dict[str, Any]:
+        """Return the shared state dict for this run (empty if not written yet)."""
+
+        path = self.path(STATE_FILENAME)
+        if not path.exists():
+            return {}
+        parsed: Any = json.loads(path.read_text())
+        return parsed if isinstance(parsed, dict) else {}
+
+    def write_state(self, state: Mapping[str, Any]) -> None:
+        """Persist the shared state dict for later stages in this run."""
+
+        self.path(STATE_FILENAME).write_text(
+            json.dumps(state, ensure_ascii=False, indent=2)
+        )

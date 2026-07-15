@@ -1,0 +1,18 @@
+# Secrets / local env
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+
+# Worker scratch space
+/tmp/jobs/

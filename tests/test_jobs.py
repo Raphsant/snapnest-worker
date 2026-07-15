@@ -12,6 +12,7 @@ def test_from_row_maps_prisma_camelcase() -> None:
     row: dict[str, Any] = {
         "id": "job-1",
         "sourceFileId": "file-1",
+        "sourceS3Key": "agency/raw/file-1.mp4",
         "agencyId": "agency-1",
         "requestedById": "user-1",
         "status": "QUEUED",
@@ -23,6 +24,7 @@ def test_from_row_maps_prisma_camelcase() -> None:
 
     assert job.id == "job-1"
     assert job.source_file_id == "file-1"
+    assert job.source_s3_key == "agency/raw/file-1.mp4"
     assert job.agency_id == "agency-1"
     assert job.requested_by_id == "user-1"
     assert job.status == "QUEUED"
@@ -53,7 +55,8 @@ def test_every_write_bumps_updated_at(monkeypatch: pytest.MonkeyPatch) -> None:
     jobs.set_current_stage(conn, "job-1", "download")
     jobs.mark_completed(conn, "job-1")
     jobs.mark_failed(conn, "job-1", "boom")
+    jobs.save_manifest_awaiting_approval(conn, "job-1", {"status": "pending_approval"})
 
-    assert len(calls) == 4
+    assert len(calls) == 5
     for sql in calls:
         assert '"updatedAt" = now()' in sql

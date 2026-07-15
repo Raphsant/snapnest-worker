@@ -1,13 +1,4 @@
-"""Stage framework.
-
-A stage is a plain callable that receives a :class:`StageContext` and performs
-one step of the pipeline (download, transcode, upload, etc.). Stages are run in
-the order they appear in :data:`STAGES`; the worker writes each stage's name to
-``PipelineJob."currentStage"`` before invoking it.
-
-There are intentionally NO stages yet — they arrive as separate tasks. With an
-empty list the worker loads a job, runs zero stages, and marks it done.
-"""
+"""Stage framework and entry-stage dispatch table."""
 
 from __future__ import annotations
 
@@ -18,7 +9,7 @@ from psycopg import Connection
 from psycopg.rows import DictRow
 
 from worker.config import Config
-from worker.jobs import Job
+from worker.jobs import Job, PipelineJobStatus
 from worker.workspace import Workspace
 
 
@@ -34,6 +25,42 @@ class StageContext:
 
 # A stage takes the context and runs for its side effects. Raise to fail the job.
 Stage = Callable[[StageContext], None]
+StageSequence = tuple[tuple[str, Stage], ...]
 
-# Ordered pipeline stages: (name, callable). Empty for now.
-STAGES: list[tuple[str, Stage]] = []
+
+@dataclass(frozen=True)
+class EntryPoint:
+    """Required job status and ordered stages for one message entry stage."""
+
+    required_status: PipelineJobStatus
+    stages: StageSequence
+
+# Imported after StageContext/Stage are defined so the stages can reference them
+# (they only import them under TYPE_CHECKING, so there's no import cycle).
+from worker.stages.build import run_build  # noqa: E402
+from worker.stages.creative import run_creative  # noqa: E402
+from worker.stages.cut import run_cut  # noqa: E402
+from worker.stages.curate import run_curate  # noqa: E402
+from worker.stages.ingest import run_ingest  # noqa: E402
+
+# Message entry stage -> required DB status + ordered stages to execute.
+ENTRY_POINTS: dict[str, EntryPoint] = {
+    "ingest": EntryPoint(
+        required_status=PipelineJobStatus.QUEUED,
+        stages=(
+            ("ingest", run_ingest),
+            ("curate", run_curate),
+            ("build", run_build),
+        ),
+    ),
+    "cut": EntryPoint(
+        required_status=PipelineJobStatus.APPROVED,
+        stages=(
+            ("cut", run_cut),
+            ("creative", run_creative),
+        ),
+    ),
+}
+
+# Backward-compatible name for tests and callers that mean the initial pipeline.
+STAGES: list[tuple[str, Stage]] = list(ENTRY_POINTS["ingest"].stages)
