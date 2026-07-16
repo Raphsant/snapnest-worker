@@ -13,6 +13,7 @@ import pytest
 from worker import higgsfield
 from worker.higgsfield import (
     GenerationParams,
+    HiggsfieldAmbiguousSubmitError,
     HiggsfieldDownloadError,
     HiggsfieldError,
 )
@@ -124,7 +125,7 @@ def test_generate_happy_path(
     _install_subprocess_responses(
         monkeypatch,
         [
-            _completed(json.dumps({"id": GENERATION_ID})),
+            _completed(json.dumps([GENERATION_ID])),
             _completed(
                 json.dumps(
                     {
@@ -146,6 +147,32 @@ def test_generate_happy_path(
     assert result.result_url == RESULT_URL
     assert result.credits_charged is None
     assert result.elapsed_s >= 0
+
+
+def test_create_object_shape_remains_supported(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_subprocess_responses(
+        monkeypatch,
+        [
+            _completed(json.dumps({"id": GENERATION_ID})),
+            _completed(
+                json.dumps(
+                    {
+                        "id": GENERATION_ID,
+                        "status": "completed",
+                        "result_url": RESULT_URL,
+                    }
+                )
+            ),
+        ],
+    )
+    _install_download(monkeypatch, b"mp4 bytes")
+
+    result = higgsfield.generate(_params(), tmp_path / "video.mp4")
+
+    assert result.id == GENERATION_ID
 
 
 def test_public_download_writes_non_empty_file_atomically(
@@ -194,17 +221,31 @@ def test_cost_exit_zero_with_non_json_stdout_raises(
     assert "Usage: help text" in raised.value.stdout_tail
 
 
-def test_submit_exit_zero_with_non_json_stdout_raises(
+def test_submit_exit_zero_with_non_json_stdout_is_ambiguous(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     _install_subprocess_responses(monkeypatch, [_completed("Usage: help text")])
 
-    with pytest.raises(HiggsfieldError) as raised:
+    with pytest.raises(HiggsfieldAmbiguousSubmitError) as raised:
         higgsfield.generate(_params(), tmp_path / "video.mp4")
 
     assert raised.value.exit_code == 0
     assert "Usage: help text" in raised.value.stdout_tail
+    assert raised.value.raw_stdout == "Usage: help text"
+
+
+def test_submit_unrecognized_json_shape_is_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    raw_stdout = json.dumps([GENERATION_ID, "unexpected-second-id"])
+    _install_subprocess_responses(monkeypatch, [_completed(raw_stdout)])
+
+    with pytest.raises(HiggsfieldAmbiguousSubmitError) as raised:
+        higgsfield.generate(_params(), tmp_path / "video.mp4")
+
+    assert raised.value.raw_stdout == raw_stdout
 
 
 def test_poll_failure_status_raises_immediately_with_id(
@@ -214,7 +255,7 @@ def test_poll_failure_status_raises_immediately_with_id(
     calls = _install_subprocess_responses(
         monkeypatch,
         [
-            _completed(json.dumps({"id": GENERATION_ID})),
+            _completed(json.dumps([GENERATION_ID])),
             _completed(
                 json.dumps({"id": GENERATION_ID, "status": "failed"})
             ),
@@ -235,7 +276,7 @@ def test_unknown_status_warns_and_polling_continues(
     calls = _install_subprocess_responses(
         monkeypatch,
         [
-            _completed(json.dumps({"id": GENERATION_ID})),
+            _completed(json.dumps([GENERATION_ID])),
             _completed(
                 json.dumps({"id": GENERATION_ID, "status": "transcoding"})
             ),
@@ -269,7 +310,7 @@ def test_generation_timeout_raises_with_id(
     _install_subprocess_responses(
         monkeypatch,
         [
-            _completed(json.dumps({"id": GENERATION_ID})),
+            _completed(json.dumps([GENERATION_ID])),
             _completed(json.dumps({"id": GENERATION_ID, "status": "running"})),
         ],
     )
@@ -292,7 +333,7 @@ def test_zero_byte_download_raises_distinct_error_and_leaves_no_output(
     _install_subprocess_responses(
         monkeypatch,
         [
-            _completed(json.dumps({"id": GENERATION_ID})),
+            _completed(json.dumps([GENERATION_ID])),
             _completed(
                 json.dumps(
                     {
@@ -321,7 +362,7 @@ def test_download_failure_carries_generation_id_and_result_url(
     _install_subprocess_responses(
         monkeypatch,
         [
-            _completed(json.dumps({"id": GENERATION_ID})),
+            _completed(json.dumps([GENERATION_ID])),
             _completed(
                 json.dumps(
                     {

@@ -544,6 +544,12 @@ def _generate_with_retry(
         try:
             result = higgsfield.generate(params, output_path)
             return _asset_generation(result)
+        except higgsfield.HiggsfieldAmbiguousSubmitError as exc:
+            raise GenerateError(
+                f"generate: clip {clip_id} asset {asset} submit response was "
+                "ambiguous; generation may be paid, NOT retrying; "
+                f"raw_stdout={exc.raw_stdout}"
+            ) from exc
         except higgsfield.HiggsfieldDownloadError as exc:
             generation_id = exc.generation_id
             if generation_id is None:

@@ -357,6 +357,43 @@ def test_mid_package_failure_preserves_prior_checkpoint(
     assert harness.heartbeats == [1]
 
 
+def test_ambiguous_submit_is_not_retried_and_preserves_raw_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = _harness(
+        monkeypatch,
+        tmp_path,
+        _manifest(checkpointed=("outro", "bridge_in", "bridge_out")),
+    )
+    _install_costs_and_balance(monkeypatch, balance=1000)
+    raw_stdout = '["possible-orphan-id", "unexpected-second-value"]'
+    generate_calls: list[GenerationParams] = []
+
+    def ambiguous_submit(
+        params: GenerationParams, output_path: Path
+    ) -> GenerationResult:
+        generate_calls.append(params)
+        raise higgsfield.HiggsfieldAmbiguousSubmitError(
+            command=("higgsfield", "generate", "create"),
+            raw_stdout=raw_stdout,
+        )
+
+    monkeypatch.setattr(
+        "worker.stages.generate.higgsfield.generate",
+        ambiguous_submit,
+    )
+
+    with pytest.raises(GenerateError) as raised:
+        harness.run()
+
+    assert len(generate_calls) == 1
+    assert raw_stdout in str(raised.value)
+    assert "NOT retrying" in str(raised.value)
+    assert harness.db.checkpoints == []
+    assert harness.heartbeats == []
+
+
 def test_success_checkpoints_each_asset_and_heartbeats_each_time(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

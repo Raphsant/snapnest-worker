@@ -108,6 +108,20 @@ class HiggsfieldDownloadError(HiggsfieldError):
         )
 
 
+class HiggsfieldAmbiguousSubmitError(HiggsfieldError):
+    """Create exited successfully, but its stdout cannot identify the paid job."""
+
+    def __init__(self, *, command: Sequence[str], raw_stdout: str) -> None:
+        self.raw_stdout = _redact_text(raw_stdout)
+        super().__init__(
+            "Higgsfield create exited 0 with an unrecognized response; "
+            "a generation may have been submitted and charged",
+            command=command,
+            exit_code=0,
+            stdout_tail=self.raw_stdout,
+        )
+
+
 def balance() -> int:
     """Return the signed-in account's available credit balance."""
 
@@ -142,8 +156,7 @@ def generate(params: GenerationParams, output_path: Path) -> GenerationResult:
         *_generation_arguments(params),
         "--json",
     ]
-    created = _run_json(create_command, required_fields=("id",))
-    generation_id = _required_string(created, "id", create_command)
+    generation_id = _run_create(create_command)
 
     result_url = _poll_until_complete(generation_id, deadline)
     logger.info(
@@ -302,6 +315,73 @@ def _run_json(
     required_fields: Sequence[str],
     timeout_s: float = CLI_TIMEOUT_S,
 ) -> dict[str, object]:
+    completed = _run_cli(command, timeout_s=timeout_s)
+
+    try:
+        parsed: object = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise HiggsfieldError(
+            "Higgsfield CLI exited 0 but stdout was not valid JSON",
+            command=command,
+            exit_code=0,
+            stderr_tail=completed.stderr,
+            stdout_tail=completed.stdout,
+        ) from exc
+
+    if not isinstance(parsed, dict):
+        raise HiggsfieldError(
+            "Higgsfield CLI exited 0 but JSON stdout was not an object",
+            command=command,
+            exit_code=0,
+            stderr_tail=completed.stderr,
+            stdout_tail=completed.stdout,
+        )
+    data = cast(dict[str, object], parsed)
+
+    missing = [field for field in required_fields if field not in data]
+    if missing:
+        raise HiggsfieldError(
+            f"Higgsfield JSON response missing fields: {', '.join(missing)}",
+            command=command,
+            exit_code=0,
+            stderr_tail=completed.stderr,
+            stdout_tail=completed.stdout,
+        )
+    return data
+
+
+def _run_create(command: Sequence[str]) -> str:
+    completed = _run_cli(command, timeout_s=CLI_TIMEOUT_S)
+    try:
+        parsed: object = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise HiggsfieldAmbiguousSubmitError(
+            command=command,
+            raw_stdout=completed.stdout,
+        ) from exc
+
+    if isinstance(parsed, list) and len(parsed) == 1:
+        generation_id = parsed[0]
+        if isinstance(generation_id, str) and generation_id:
+            return generation_id
+
+    if isinstance(parsed, dict):
+        data = cast(dict[str, object], parsed)
+        generation_id = data.get("id")
+        if isinstance(generation_id, str) and generation_id:
+            return generation_id
+
+    raise HiggsfieldAmbiguousSubmitError(
+        command=command,
+        raw_stdout=completed.stdout,
+    )
+
+
+def _run_cli(
+    command: Sequence[str],
+    *,
+    timeout_s: float,
+) -> subprocess.CompletedProcess[str]:
     safe_command = _redact_command(command)
     logger.info("Running Higgsfield command: %s", _command_for_log(safe_command))
 
@@ -336,38 +416,7 @@ def _run_json(
             stderr_tail=completed.stderr,
             stdout_tail=completed.stdout,
         )
-
-    try:
-        parsed: object = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise HiggsfieldError(
-            "Higgsfield CLI exited 0 but stdout was not valid JSON",
-            command=command,
-            exit_code=0,
-            stderr_tail=completed.stderr,
-            stdout_tail=completed.stdout,
-        ) from exc
-
-    if not isinstance(parsed, dict):
-        raise HiggsfieldError(
-            "Higgsfield CLI exited 0 but JSON stdout was not an object",
-            command=command,
-            exit_code=0,
-            stderr_tail=completed.stderr,
-            stdout_tail=completed.stdout,
-        )
-    data = cast(dict[str, object], parsed)
-
-    missing = [field for field in required_fields if field not in data]
-    if missing:
-        raise HiggsfieldError(
-            f"Higgsfield JSON response missing fields: {', '.join(missing)}",
-            command=command,
-            exit_code=0,
-            stderr_tail=completed.stderr,
-            stdout_tail=completed.stdout,
-        )
-    return data
+    return completed
 
 
 def _required_string(
