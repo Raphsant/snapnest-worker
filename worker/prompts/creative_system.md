@@ -63,6 +63,11 @@ reinforces the brand.
   line derived from the clip's takeaway (max 7 words, clip's language).
 - Same visual identity, ~5 seconds, 9:16, no spoken dialogue.
 
+ON-SCREEN TEXT INTEGRITY: wherever on-screen text is referenced inside
+hook_prompt or close_prompt, it must repeat hook_on_screen_text or
+close_on_screen_text EXACTLY, character for character, including
+punctuation, accents, and casing.
+
 CAPTIONS (three versions, clip's language):
 YOUTUBE SHORTS — value-first: lead with the concrete lesson; the reader
 should feel "I learned something I didn't know" from caption + clip

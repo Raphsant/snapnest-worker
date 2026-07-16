@@ -8,6 +8,7 @@ from worker.stages.creative import (
     CreativeError,
     compose_manifest_fields,
     extract_json,
+    find_on_screen_text_mismatches,
     validate_creative_json,
     validate_creative_manifest,
 )
@@ -73,6 +74,44 @@ def test_compose_manifest_fields_matches_backend_plain_string_format() -> None:
             "Compliance check: PASS"
         ),
     }
+
+
+def test_on_screen_text_exact_verbatim_containment_passes() -> None:
+    package = _package()
+    package["hook_prompt"] = (
+        'Animate "TRATA EL TRADING EN SERIO" over the market screens.'
+    )
+    package["close_prompt"] = (
+        'Resolve on "EL PROCESO ES LA VENTAJA" beside the STC logo.'
+    )
+
+    assert find_on_screen_text_mismatches(package) == []
+
+
+def test_on_screen_text_mojibake_trips_hook_warning_check() -> None:
+    package = _package()
+    package["hook_on_screen_text"] = "¿POR QUÉ FALLAN?"
+    package["hook_prompt"] = 'Animate "ÃPOR QUÉ FALLAN?" over the chart.'
+    package["close_prompt"] = (
+        'Resolve on "EL PROCESO ES LA VENTAJA" beside the STC logo.'
+    )
+
+    assert find_on_screen_text_mismatches(package) == [
+        ("hook_on_screen_text", "hook_prompt")
+    ]
+
+
+def test_on_screen_text_accent_difference_trips_close_warning_check() -> None:
+    package = _package()
+    package["hook_prompt"] = (
+        'Animate "TRATA EL TRADING EN SERIO" over the market screens.'
+    )
+    package["close_on_screen_text"] = "TÚ CONTROLAS EL RIESGO"
+    package["close_prompt"] = 'Resolve on "TU CONTROLAS EL RIESGO".'
+
+    assert find_on_screen_text_mismatches(package) == [
+        ("close_on_screen_text", "close_prompt")
+    ]
 
 
 def test_validate_creative_manifest_copies_and_selects_only_approved() -> None:

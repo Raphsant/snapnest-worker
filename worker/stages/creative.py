@@ -30,6 +30,10 @@ REQUIRED_RESPONSE_FIELDS: tuple[str, ...] = (
     "caption_instagram",
     "compliance_check",
 )
+ON_SCREEN_TEXT_PROMPT_PAIRS: tuple[tuple[str, str], ...] = (
+    ("hook_on_screen_text", "hook_prompt"),
+    ("close_on_screen_text", "close_prompt"),
+)
 
 
 class CreativeError(RuntimeError):
@@ -149,6 +153,18 @@ def compose_manifest_fields(package: Mapping[str, str]) -> dict[str, str]:
             f'Compliance check: {package["compliance_check"]}'
         ),
     }
+
+
+def find_on_screen_text_mismatches(
+    package: Mapping[str, str],
+) -> list[tuple[str, str]]:
+    """Return field pairs whose exact on-screen text is absent from the prompt."""
+
+    return [
+        (text_field, prompt_field)
+        for text_field, prompt_field in ON_SCREEN_TEXT_PROMPT_PAIRS
+        if package[text_field] not in package[prompt_field]
+    ]
 
 
 def validate_creative_manifest(
@@ -284,6 +300,17 @@ def _message_text(message: Any) -> str:
 def _log_package_warnings(
     job_id: str, clip_id: str, package: Mapping[str, str]
 ) -> None:
+    for text_field, prompt_field in find_on_screen_text_mismatches(package):
+        logger.warning(
+            "creative[%s]: clip=%s on-screen text mismatch: %s=%r | %s=%r",
+            job_id,
+            clip_id,
+            text_field,
+            package[text_field],
+            prompt_field,
+            package[prompt_field],
+        )
+
     hook_words = len(package["hook_on_screen_text"].split())
     if hook_words > 6:
         logger.warning(
