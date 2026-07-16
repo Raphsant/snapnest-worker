@@ -17,10 +17,19 @@ def test_cut_entry_runs_cut_then_creative() -> None:
     assert [name for name, _ in entry.stages] == ["cut", "creative"]
 
 
-def test_generate_entry_is_not_registered() -> None:
-    assert "generate" not in ENTRY_POINTS
+def test_generate_entry_requires_creative_approval() -> None:
+    entry = ENTRY_POINTS["generate"]
+
+    assert entry.required_status is PipelineJobStatus.CREATIVE_APPROVED
+    assert [name for name, _ in entry.stages] == ["generate"]
 
 
 def test_stage_context_has_expected_fields() -> None:
     field_names = {f.name for f in dataclasses.fields(StageContext)}
-    assert field_names == {"job", "workspace", "conn", "config"}
+    assert field_names == {
+        "job",
+        "workspace",
+        "conn",
+        "config",
+        "checkpoint_heartbeat",
+    }

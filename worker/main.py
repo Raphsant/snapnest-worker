@@ -18,7 +18,7 @@ import logging
 import signal
 import sys
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
@@ -34,6 +34,8 @@ from worker.stages import ENTRY_POINTS, EntryPoint, StageContext, StageSequence
 from worker.workspace import Workspace
 
 logger = logging.getLogger(__name__)
+
+CHECKPOINT_VISIBILITY_TIMEOUT_S = 3600
 
 
 @dataclass(frozen=True)
@@ -174,7 +176,14 @@ class Worker:
                     self._s3,
                     self._config.s3_bucket,
                 ) as workspace:
-                    self._run_stages(job, workspace, stages)
+                    self._run_stages(
+                        job,
+                        workspace,
+                        stages,
+                        checkpoint_heartbeat=lambda: self._checkpoint_heartbeat(
+                            message.receipt_handle
+                        ),
+                    )
             self._finalize(job_id, stages[-1][0])
         except Exception as exc:
             logger.exception("Job %s FAILED", job_id)
@@ -202,19 +211,36 @@ class Worker:
             )
 
     def _run_stages(
-        self, job: Job, workspace: Workspace, stages: StageSequence
+        self,
+        job: Job,
+        workspace: Workspace,
+        stages: StageSequence,
+        *,
+        checkpoint_heartbeat: Callable[[], None],
     ) -> None:
         context = StageContext(
             job=job,
             workspace=workspace,
             conn=self._conn,
             config=self._config,
+            checkpoint_heartbeat=checkpoint_heartbeat,
         )
         logger.info("Job %s: running %d stage(s)", job.id, len(stages))
         for name, stage in stages:
             logger.info("Job %s -> stage %s", job.id, name)
             jobs.set_current_stage(self._conn, job.id, name)
             stage(context)
+
+    def _checkpoint_heartbeat(self, receipt_handle: str) -> None:
+        try:
+            self._queue.change_visibility(
+                receipt_handle, CHECKPOINT_VISIBILITY_TIMEOUT_S
+            )
+        except Exception:
+            logger.warning(
+                "Checkpoint heartbeat failed to reset SQS visibility",
+                exc_info=True,
+            )
 
     def _record_failure(self, job_id: str, exc: Exception) -> None:
         detail = f"{type(exc).__name__}: {exc}"

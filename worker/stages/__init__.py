@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 from psycopg import Connection
 from psycopg.rows import DictRow
@@ -11,6 +12,10 @@ from psycopg.rows import DictRow
 from worker.config import Config
 from worker.jobs import Job, PipelineJobStatus
 from worker.workspace import Workspace
+
+
+def _noop_checkpoint_heartbeat() -> None:
+    """Default for contexts created outside the worker poll loop."""
 
 
 @dataclass
@@ -21,6 +26,7 @@ class StageContext:
     workspace: Workspace
     conn: Connection[DictRow]
     config: Config
+    checkpoint_heartbeat: Callable[[], None] = _noop_checkpoint_heartbeat
 
 
 # A stage takes the context and runs for its side effects. Raise to fail the job.
@@ -41,6 +47,7 @@ from worker.stages.build import run_build  # noqa: E402
 from worker.stages.creative import run_creative  # noqa: E402
 from worker.stages.cut import run_cut  # noqa: E402
 from worker.stages.curate import run_curate  # noqa: E402
+from worker.stages.generate import run_generate  # noqa: E402
 from worker.stages.ingest import run_ingest  # noqa: E402
 
 # Message entry stage -> required DB status + ordered stages to execute.
@@ -59,6 +66,10 @@ ENTRY_POINTS: dict[str, EntryPoint] = {
             ("cut", run_cut),
             ("creative", run_creative),
         ),
+    ),
+    "generate": EntryPoint(
+        required_status=PipelineJobStatus.CREATIVE_APPROVED,
+        stages=(("generate", cast(Stage, run_generate)),),
     ),
 }
 

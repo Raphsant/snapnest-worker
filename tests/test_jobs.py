@@ -41,6 +41,45 @@ def test_truncate_error_leaves_short_messages() -> None:
     assert jobs.truncate_error("boom") == "boom"
 
 
+def test_load_manifest_returns_authoritative_db_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = {"status": "approved", "clips": []}
+
+    def fake_fetch_one(conn: Any, sql: str, params: Any = None) -> dict[str, Any]:
+        assert '"manifest"' in sql
+        assert params == ("job-1",)
+        return {"manifest": manifest}
+
+    monkeypatch.setattr("worker.db.fetch_one", fake_fetch_one)
+
+    assert jobs.load_manifest(cast(Any, object()), "job-1") is manifest
+
+
+def test_checkpoint_updates_only_manifest_and_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_execute(conn: Any, sql: str, params: Any = None) -> int:
+        calls.append(sql)
+        return 1
+
+    monkeypatch.setattr("worker.db.execute", fake_execute)
+
+    jobs.save_manifest_checkpoint(
+        cast(Any, object()),
+        "job-1",
+        {"status": "approved", "clips": []},
+    )
+
+    assert len(calls) == 1
+    assert '"manifest" = %s' in calls[0]
+    assert '"updatedAt" = now()' in calls[0]
+    assert '"status"' not in calls[0]
+    assert '"currentStage"' not in calls[0]
+
+
 def test_every_write_bumps_updated_at(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
 

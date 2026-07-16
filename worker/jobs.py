@@ -110,6 +110,29 @@ def current_status(conn: Connection[DictRow], job_id: str) -> str | None:
     return str(row["status"]) if row is not None else None
 
 
+def load_manifest(conn: Connection[DictRow], job_id: str) -> object | None:
+    """Reload the authoritative manifest from the job row."""
+
+    row = db.fetch_one(
+        conn, 'SELECT "manifest" FROM "PipelineJob" WHERE "id" = %s', (job_id,)
+    )
+    return row["manifest"] if row is not None else None
+
+
+def save_manifest_checkpoint(
+    conn: Connection[DictRow], job_id: str, manifest: Mapping[str, Any]
+) -> None:
+    """Persist generated-asset progress without changing job lifecycle state."""
+
+    db.execute(
+        conn,
+        'UPDATE "PipelineJob" '
+        'SET "manifest" = %s, "updatedAt" = now() '
+        'WHERE "id" = %s',
+        (Json(manifest), job_id),
+    )
+
+
 def save_manifest_awaiting_approval(
     conn: Connection[DictRow], job_id: str, manifest: Mapping[str, Any]
 ) -> None:
