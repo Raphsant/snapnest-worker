@@ -94,6 +94,9 @@ If technical, prioritize in this order:
 First the <transcript_review> section. Then the JSON below and NOTHING
 after it. Exact field names — a script parses this literally:
 
+If no segments in the requested category meet the bar, respond with
+exactly {"clips": []}; never prose.
+
 {
   "category": "mindset or technical — whichever the user requested",
   "selected_clips": [

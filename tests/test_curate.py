@@ -7,6 +7,7 @@ import pytest
 from worker.stages.curate import (
     CurationError,
     extract_json,
+    normalize_curation_result,
     parse_srt_indexes,
     validate_curation,
 )
@@ -77,10 +78,20 @@ def test_validate_category_mismatch_raises() -> None:
         validate_curation(data, category="mindset", srt_indexes=INDEXES)
 
 
-def test_validate_empty_clips_raises() -> None:
+def test_validate_empty_clips_returns_empty_list() -> None:
     data = {"category": "mindset", "selected_clips": []}
-    with pytest.raises(CurationError):
-        validate_curation(data, category="mindset", srt_indexes=INDEXES)
+
+    assert validate_curation(data, category="mindset", srt_indexes=INDEXES) == []
+
+
+def test_normalize_exact_empty_category_response() -> None:
+    result = normalize_curation_result({"clips": []}, category="technical")
+
+    assert result == {
+        "category": "technical",
+        "selected_clips": [],
+        "rejected_segments": [],
+    }
 
 
 def test_validate_drops_nonexistent_index() -> None:

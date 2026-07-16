@@ -28,6 +28,7 @@ CATEGORIES = ("mindset", "technical")
 
 # Anthropic call parameters.
 MAX_TOKENS = 16000
+RAW_OUTPUT_LOG_LIMIT = 2000
 
 # If more than this fraction of a category's clips reference indexes that don't
 # exist (or are otherwise invalid), we assume the model misread the SRT and fail
@@ -64,13 +65,16 @@ def run_curate(ctx: StageContext) -> None:
 
     for category in CATEGORIES:
         logger.info("curate[%s]: curating %s", job.id, category)
-        result = _curate_category(
-            client,
-            model=cfg.curator_model,
-            system_prompt=system_prompt,
-            srt_text=srt_text,
+        result = normalize_curation_result(
+            _curate_category(
+                client,
+                model=cfg.curator_model,
+                system_prompt=system_prompt,
+                srt_text=srt_text,
+                category=category,
+                job_id=job.id,
+            ),
             category=category,
-            job_id=job.id,
         )
         result["selected_clips"] = validate_curation(
             result, category=category, srt_indexes=srt_indexes, job_id=job.id
@@ -139,6 +143,20 @@ def parse_srt_indexes(srt_text: str) -> set[int]:
     return indexes
 
 
+def normalize_curation_result(
+    data: dict[str, Any], *, category: str
+) -> dict[str, Any]:
+    """Convert the prompt's exact empty-category response to the stored schema."""
+
+    if data == {"clips": []}:
+        return {
+            "category": category,
+            "selected_clips": [],
+            "rejected_segments": [],
+        }
+    return data
+
+
 def validate_curation(
     data: dict[str, Any],
     *,
@@ -150,7 +168,7 @@ def validate_curation(
 
     Hard failures (raise :class:`CurationError`):
       * ``category`` doesn't match the requested one
-      * ``selected_clips`` is missing/empty/not a list
+      * ``selected_clips`` is missing or not a list
       * more than ``DROP_THRESHOLD`` of the clips were invalid (model misread)
       * nothing valid survives
 
@@ -164,8 +182,10 @@ def validate_curation(
         )
 
     clips = data.get("selected_clips")
-    if not isinstance(clips, list) or not clips:
-        raise CurationError(f"{category}: selected_clips is empty or not a list")
+    if not isinstance(clips, list):
+        raise CurationError(f"{category}: selected_clips is not a list")
+    if not clips:
+        return []
 
     valid: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -270,11 +290,15 @@ def _curate_category(
     first_text = _message_text(first)
     try:
         return extract_json(first_text)
-    except ValueError:
+    except ValueError as exc:
         logger.warning(
-            "curate[%s]: %s output was not valid JSON; retrying once",
+            "curate[%s]: %s attempt 1 output was not valid JSON (%s); "
+            "raw output (max %d chars): %s",
             job_id,
             category,
+            exc,
+            RAW_OUTPUT_LOG_LIMIT,
+            first_text[:RAW_OUTPUT_LOG_LIMIT],
         )
 
     second = _create_message(client, model=model, system=system_prompt, messages=[
@@ -286,8 +310,20 @@ def _curate_category(
         },
     ])
     _log_usage(second, category=category, job_id=job_id, attempt=2)
-    # A second failure raises ValueError -> the job fails (better than garbage).
-    return extract_json(_message_text(second))
+    second_text = _message_text(second)
+    try:
+        return extract_json(second_text)
+    except ValueError as exc:
+        logger.warning(
+            "curate[%s]: %s attempt 2 output was not valid JSON (%s); "
+            "raw output (max %d chars): %s",
+            job_id,
+            category,
+            exc,
+            RAW_OUTPUT_LOG_LIMIT,
+            second_text[:RAW_OUTPUT_LOG_LIMIT],
+        )
+        raise
 
 
 def _create_message(
