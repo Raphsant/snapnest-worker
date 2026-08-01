@@ -48,7 +48,19 @@ def run_ingest(ctx: StageContext) -> None:
     ws = ctx.workspace
     job = ctx.job
 
+    # source_s3_key is already resolved by load_job's COALESCE: the MediaFile
+    # key for a file job, or the job's own sourceS3Key (written by the download
+    # stage) for a YouTube job. Either way ingest just reads it. It is only None
+    # when neither exists — a file job with no MediaFile *and* no key, or a
+    # YouTube job that reached ingest without a download. That's a backend/route
+    # bug, so fail loudly rather than call S3 with a None key.
     source_key = job.source_s3_key
+    if source_key is None:
+        raise RuntimeError(
+            f"ingest: job {job.id} has no source to ingest — sourceFileId="
+            f"{job.source_file_id!r} and sourceS3Key are both NULL "
+            "(backend bug, or the download stage did not run)"
+        )
     ext = Path(source_key).suffix or ".mp4"
     logger.info("ingest[%s]: downloading source %s", job.id, source_key)
     local_source = ws.download(source_key, f"source{ext}")

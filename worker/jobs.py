@@ -40,18 +40,27 @@ class PipelineJobStatus(StrEnum):
 class Job:
     """A single PipelineJob row (the columns the worker cares about).
 
-    ``source_s3_key`` is joined in from the related ``MediaFile`` row so stages
-    know which object to download without a second query.
+    ``source_s3_key`` is resolved with ``COALESCE(j."sourceS3Key", f."s3Key")``:
+    a file-triggered job gets its key from the related ``MediaFile`` row, while
+    a YouTube job carries its own ``sourceS3Key`` (written by the download stage)
+    and has no ``MediaFile``. It is therefore ``None`` for a YouTube job that has
+    not been downloaded yet.
+
+    ``source_file_id``/``agency_id`` are ``None`` for YouTube jobs; ``source_type``
+    and ``source_url`` distinguish and drive them (``source_type == "YOUTUBE"``,
+    ``source_url`` = the canonical URL to fetch).
     """
 
     id: str
-    source_file_id: str
-    source_s3_key: str
-    agency_id: str
+    source_file_id: str | None
+    source_s3_key: str | None
+    agency_id: str | None
     requested_by_id: str
     status: str
     current_stage: str | None
     error: str | None
+    source_type: str | None = None
+    source_url: str | None = None
     manifest: object | None = None
 
     @classmethod
@@ -65,20 +74,29 @@ class Job:
             status=row["status"],
             current_stage=row["currentStage"],
             error=row["error"],
+            source_type=row.get("sourceType"),
+            source_url=row.get("sourceUrl"),
             manifest=row.get("manifest"),
         )
 
 
 def load_job(conn: Connection[DictRow], job_id: str) -> Job | None:
-    """Fetch a job by id (with its source file's S3 key), or None if missing."""
+    """Fetch a job by id, or None if missing.
+
+    A LEFT JOIN keeps YouTube jobs (``sourceFileId IS NULL``, no ``MediaFile``)
+    visible; without it the inner join dropped them and the worker saw
+    "not found". ``sourceS3Key`` coalesces the job's own column (YouTube jobs,
+    set by the download stage) over the joined ``MediaFile.s3Key`` (file jobs).
+    """
 
     row = db.fetch_one(
         conn,
         'SELECT j."id", j."sourceFileId", j."agencyId", j."requestedById", '
         'j."status", j."currentStage", j."error", j."manifest", '
-        'f."s3Key" AS "sourceS3Key" '
+        'j."sourceType", j."sourceUrl", '
+        'COALESCE(j."sourceS3Key", f."s3Key") AS "sourceS3Key" '
         'FROM "PipelineJob" j '
-        'JOIN "MediaFile" f ON f."id" = j."sourceFileId" '
+        'LEFT JOIN "MediaFile" f ON f."id" = j."sourceFileId" '
         'WHERE j."id" = %s',
         (job_id,),
     )
@@ -98,6 +116,21 @@ def set_current_stage(conn: Connection[DictRow], job_id: str, stage: str) -> Non
         conn,
         'UPDATE "PipelineJob" SET "currentStage" = %s, "updatedAt" = now() WHERE "id" = %s',
         (stage, job_id),
+    )
+
+
+def set_source_s3_key(conn: Connection[DictRow], job_id: str, s3_key: str) -> None:
+    """Record the downloaded source's S3 key on the job row (download stage).
+
+    This is the durable checkpoint for a YouTube download: once set (and the
+    object exists in S3) a redelivered message must not re-download.
+    """
+
+    db.execute(
+        conn,
+        'UPDATE "PipelineJob" SET "sourceS3Key" = %s, "updatedAt" = now() '
+        'WHERE "id" = %s',
+        (s3_key, job_id),
     )
 
 

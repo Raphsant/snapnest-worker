@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
+from worker.jobs import Job
 from worker.stages.ingest import (
     _s3_key_from_uri,
     build_ffmpeg_command,
@@ -10,7 +14,30 @@ from worker.stages.ingest import (
     correct_transcript_json,
     extract_bleep_ranges,
     merge_ranges,
+    run_ingest,
 )
+
+
+# --- run_ingest source guard ----------------------------------------------- #
+
+
+def test_run_ingest_fails_when_no_source() -> None:
+    # Both sourceFileId and sourceS3Key NULL (a backend bug, or a YouTube job
+    # that reached ingest without a download) — fail loudly before any S3 call.
+    job = Job(
+        id="job-x",
+        source_file_id=None,
+        source_s3_key=None,
+        agency_id=None,
+        requested_by_id="user-1",
+        status="RUNNING",
+        current_stage="ingest",
+        error=None,
+    )
+    ctx = SimpleNamespace(config=object(), workspace=object(), job=job)
+
+    with pytest.raises(RuntimeError, match="no source to ingest"):
+        run_ingest(ctx)  # type: ignore[arg-type]
 
 
 # --- merge_ranges ---------------------------------------------------------- #

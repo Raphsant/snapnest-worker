@@ -47,11 +47,25 @@ from worker.stages.build import run_build  # noqa: E402
 from worker.stages.creative import run_creative  # noqa: E402
 from worker.stages.cut import run_cut  # noqa: E402
 from worker.stages.curate import run_curate  # noqa: E402
+from worker.stages.download import run_download  # noqa: E402
 from worker.stages.generate import run_generate  # noqa: E402
 from worker.stages.ingest import run_ingest  # noqa: E402
 
 # Message entry stage -> required DB status + ordered stages to execute.
 ENTRY_POINTS: dict[str, EntryPoint] = {
+    # YouTube jobs enter here (routed off the row by resolve_entry_stage, or via
+    # an explicit stage:"download" message for a manual re-drive). After the
+    # source is staged to S3, the run flows straight into the same ingest ->
+    # curate -> build sequence a file job runs.
+    "download": EntryPoint(
+        required_status=PipelineJobStatus.QUEUED,
+        stages=(
+            ("download", run_download),
+            ("ingest", run_ingest),
+            ("curate", run_curate),
+            ("build", run_build),
+        ),
+    ),
     "ingest": EntryPoint(
         required_status=PipelineJobStatus.QUEUED,
         stages=(

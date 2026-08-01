@@ -71,6 +71,31 @@ def resolve_entry_point(entry_stage: str, job_status: str) -> EntryPoint | None:
     return entry_point
 
 
+def _needs_download(job: Job) -> bool:
+    """A YouTube job has no source in S3 yet; it must start at the download stage.
+
+    Routed off the job ROW (its ``sourceType``/``sourceFileId``), not a message
+    field — the backend enqueues a plain ``{jobId}`` for YouTube jobs.
+    """
+
+    return job.source_type == "YOUTUBE" or job.source_file_id is None
+
+
+def resolve_entry_stage(entry_stage: str, job: Job) -> str:
+    """Redirect the default pipeline entry ("ingest") to "download" for YouTube.
+
+    A plain ``{jobId}`` message defaults to the ``ingest`` entry stage
+    (:func:`parse_message_body`). A YouTube job can't ingest until its source
+    has been fetched, so it enters at ``download`` instead. File jobs, and
+    explicit non-ingest entry stages (manual re-drives, gate resumptions), are
+    left exactly as they were.
+    """
+
+    if entry_stage == "ingest" and _needs_download(job):
+        return "download"
+    return entry_stage
+
+
 def _configure_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -133,25 +158,33 @@ class Worker:
         job_id = parsed.job_id
         job = jobs.load_job(self._conn, job_id)
         if job is None:
-            logger.warning("Job %s not found in DB; deleting message", job_id)
-            self._queue.delete(message.receipt_handle)
+            # A missing job is now always a bug or a transient (e.g. the row
+            # isn't committed/visible yet), never a reason to destroy the
+            # message. Log loudly and leave the message; the visibility timeout
+            # redelivers it.
+            logger.error(
+                "Job %s NOT FOUND in DB; leaving message for redelivery "
+                "(NOT deleting)",
+                job_id,
+            )
             return
 
-        entry_point = resolve_entry_point(parsed.entry_stage, job.status)
+        entry_stage = resolve_entry_stage(parsed.entry_stage, job)
+        entry_point = resolve_entry_point(entry_stage, job.status)
         if entry_point is None:
-            required = ENTRY_POINTS[parsed.entry_stage].required_status.value
+            required = ENTRY_POINTS[entry_stage].required_status.value
             logger.info(
                 "Job %s is %s, not %s required for entry stage %s; "
                 "skipping and deleting (idempotency)",
                 job_id,
                 job.status,
                 required,
-                parsed.entry_stage,
+                entry_stage,
             )
             self._queue.delete(message.receipt_handle)
             return
 
-        self._process(job, message, parsed.entry_stage, entry_point.stages)
+        self._process(job, message, entry_stage, entry_point.stages)
 
     def _process(
         self,

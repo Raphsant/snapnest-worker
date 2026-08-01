@@ -32,6 +32,85 @@ def test_from_row_maps_prisma_camelcase() -> None:
     assert job.error is None
 
 
+def test_from_row_youtube_job_has_null_source_file() -> None:
+    row: dict[str, Any] = {
+        "id": "yt-1",
+        "sourceFileId": None,
+        "sourceS3Key": None,
+        "agencyId": None,
+        "requestedById": "user-1",
+        "status": "QUEUED",
+        "currentStage": "download",
+        "error": None,
+        "sourceType": "YOUTUBE",
+        "sourceUrl": "https://www.youtube.com/watch?v=abc",
+    }
+
+    job = Job.from_row(row)
+
+    assert job.source_file_id is None
+    assert job.source_s3_key is None
+    assert job.agency_id is None
+    assert job.source_type == "YOUTUBE"
+    assert job.source_url == "https://www.youtube.com/watch?v=abc"
+    assert job.current_stage == "download"
+
+
+def test_load_job_left_joins_and_coalesces_source_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def fake_fetch_one(conn: Any, sql: str, params: Any = None) -> dict[str, Any]:
+        seen["sql"] = sql
+        seen["params"] = params
+        return {
+            "id": "yt-1",
+            "sourceFileId": None,
+            "sourceS3Key": "pipeline/yt-1/source/source.mp4",
+            "agencyId": None,
+            "requestedById": "user-1",
+            "status": "QUEUED",
+            "currentStage": "download",
+            "error": None,
+            "sourceType": "YOUTUBE",
+            "sourceUrl": "https://youtu.be/abc",
+        }
+
+    monkeypatch.setattr("worker.db.fetch_one", fake_fetch_one)
+
+    job = jobs.load_job(cast(Any, object()), "yt-1")
+
+    assert job is not None
+    # A YouTube job (no MediaFile) must survive the join, and its own sourceS3Key
+    # must win the COALESCE.
+    assert "LEFT JOIN" in seen["sql"]
+    assert 'COALESCE(j."sourceS3Key", f."s3Key")' in seen["sql"]
+    assert '"sourceType"' in seen["sql"] and '"sourceUrl"' in seen["sql"]
+    assert seen["params"] == ("yt-1",)
+    assert job.source_s3_key == "pipeline/yt-1/source/source.mp4"
+
+
+def test_set_source_s3_key_writes_key_and_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, Any]] = []
+
+    def fake_execute(conn: Any, sql: str, params: Any = None) -> int:
+        calls.append((sql, params))
+        return 1
+
+    monkeypatch.setattr("worker.db.execute", fake_execute)
+
+    jobs.set_source_s3_key(cast(Any, object()), "yt-1", "pipeline/yt-1/source/source.mp4")
+
+    assert len(calls) == 1
+    sql, params = calls[0]
+    assert '"sourceS3Key" = %s' in sql
+    assert '"updatedAt" = now()' in sql
+    assert params == ("pipeline/yt-1/source/source.mp4", "yt-1")
+
+
 def test_truncate_error_clamps_to_max() -> None:
     clamped = jobs.truncate_error("x" * 5000)
     assert len(clamped) == jobs.ERROR_MAX_LEN
