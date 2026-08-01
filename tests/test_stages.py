@@ -21,7 +21,14 @@ def test_generate_entry_requires_creative_approval() -> None:
     entry = ENTRY_POINTS["generate"]
 
     assert entry.required_status is PipelineJobStatus.CREATIVE_APPROVED
-    assert [name for name, _ in entry.stages] == ["generate"]
+    assert [name for name, _ in entry.stages] == ["generate", "assemble"]
+
+
+def test_assemble_entry_requires_creative_approval() -> None:
+    entry = ENTRY_POINTS["assemble"]
+
+    assert entry.required_status is PipelineJobStatus.CREATIVE_APPROVED
+    assert [name for name, _ in entry.stages] == ["assemble"]
 
 
 def test_stage_context_has_expected_fields() -> None:

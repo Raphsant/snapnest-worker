@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from worker.artifacts import main_clip_key
+
 if TYPE_CHECKING:
     from worker.stages import StageContext
 
@@ -86,7 +88,7 @@ def run_cut(ctx: StageContext) -> None:
 
     for result in rendered:
         clip_id = result.clip.clip_id
-        ctx.workspace.upload(result.main, f"{prefix}clips/{clip_id}.mp4")
+        ctx.workspace.upload(result.main, main_clip_key(ctx.job.id, clip_id))
         ctx.workspace.upload(
             result.first_five,
             f"{prefix}clips/subclips/{clip_id}_first5.mp4",

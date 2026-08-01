@@ -43,6 +43,7 @@ class EntryPoint:
 
 # Imported after StageContext/Stage are defined so the stages can reference them
 # (they only import them under TYPE_CHECKING, so there's no import cycle).
+from worker.stages.assemble import run_assemble  # noqa: E402
 from worker.stages.build import run_build  # noqa: E402
 from worker.stages.creative import run_creative  # noqa: E402
 from worker.stages.cut import run_cut  # noqa: E402
@@ -83,7 +84,14 @@ ENTRY_POINTS: dict[str, EntryPoint] = {
     ),
     "generate": EntryPoint(
         required_status=PipelineJobStatus.CREATIVE_APPROVED,
-        stages=(("generate", cast(Stage, run_generate)),),
+        stages=(
+            ("generate", cast(Stage, run_generate)),
+            ("assemble", cast(Stage, run_assemble)),
+        ),
+    ),
+    "assemble": EntryPoint(
+        required_status=PipelineJobStatus.CREATIVE_APPROVED,
+        stages=(("assemble", cast(Stage, run_assemble)),),
     ),
 }
 
