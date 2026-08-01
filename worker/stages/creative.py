@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from worker import jobs
+from worker.lint import lint_prompts
 
 if TYPE_CHECKING:
     from worker.config import Config
@@ -21,19 +22,25 @@ MAX_TOKENS = 16000
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "creative_system.md"
 REQUIRED_RESPONSE_FIELDS: tuple[str, ...] = (
     "hook_angle",
-    "hook_on_screen_text",
+    "hook_text",
     "hook_prompt",
-    "close_on_screen_text",
+    "close_text",
     "close_prompt",
     "caption_youtube",
     "caption_tiktok",
     "caption_instagram",
     "compliance_check",
 )
-ON_SCREEN_TEXT_PROMPT_PAIRS: tuple[tuple[str, str], ...] = (
-    ("hook_on_screen_text", "hook_prompt"),
-    ("close_on_screen_text", "close_prompt"),
-)
+
+# Overlay copy must fit ONE line of the 9:16 drawtext overlay. These caps are
+# WARNING thresholds only — never a hard failure — which is what makes them
+# safe to ship ahead of the assembler change that re-measures them. They were
+# sized for the pre-v3.1 Arial overlay; v3.1 swaps in Anton for hook_text
+# (heavily condensed -> more chars fit) and Montserrat ExtraBold for close_text
+# (wider than Arial -> fewer fit), so BOTH numbers must be re-measured against
+# those fonts when v3.1 lands.
+HOOK_TEXT_MAX_CHARS = 22
+CLOSE_TEXT_MAX_CHARS = 24
 
 
 class CreativeError(RuntimeError):
@@ -80,6 +87,24 @@ def run_creative(ctx: StageContext) -> None:
     # valid package. This keeps persistence all-or-nothing on model failures.
     for clip, package in generated:
         clip.update(compose_manifest_fields(package))
+
+    # Enforcement choke point #1: lint the just-composed prompts and record any
+    # violations in the manifest so the operator sees them in the dashboard and
+    # rejects/regenerates. This state fires ZERO Higgsfield calls; the generate
+    # stage re-lints and hard-fails before spending credits (worker.lint).
+    violations = lint_prompts(manifest)
+    manifest["lint_violations"] = violations
+    if violations:
+        logger.warning(
+            "creative[%s]: %d generation-prompt lint violation(s) recorded "
+            "for operator review: %s",
+            ctx.job.id,
+            len(violations),
+            "; ".join(
+                f"{v['clipId']}.{v['field']} matched {v['matched_word']!r}"
+                for v in violations
+            ),
+        )
 
     manifest_path = ctx.workspace.path("manifest.json")
     manifest_path.write_text(
@@ -135,17 +160,21 @@ def validate_creative_json(data: object) -> dict[str, str]:
 
 
 def compose_manifest_fields(package: Mapping[str, str]) -> dict[str, str]:
-    """Compose the three plain-string fields consumed by the backend gate."""
+    """Compose the manifest fields written to each approved clip.
+
+    Emits native overlay copy (hook_text/close_text) consumed by the
+    assembler's drawtext, the CLEAN generation prompts consumed by the generate
+    stage (verbatim from the model — no on-screen-text prefix), and the
+    platform post copy. The overlay words live ONLY in hook_text/close_text,
+    never inside a prompt (see worker.lint and creative_system.md
+    generation_prompt_purity).
+    """
 
     return {
-        "hook_prompt": (
-            f'ON-SCREEN TEXT: "{package["hook_on_screen_text"]}" | '
-            f'ANGLE: {package["hook_angle"]}\n\n{package["hook_prompt"]}'
-        ),
-        "close_prompt": (
-            f'ON-SCREEN TEXT: "{package["close_on_screen_text"]}"\n\n'
-            f'{package["close_prompt"]}'
-        ),
+        "hook_text": package["hook_text"],
+        "hook_prompt": package["hook_prompt"],
+        "close_text": package["close_text"],
+        "close_prompt": package["close_prompt"],
         "post_copy": (
             f'### YouTube Shorts\n{package["caption_youtube"]}\n\n'
             f'### TikTok\n{package["caption_tiktok"]}\n\n'
@@ -153,18 +182,6 @@ def compose_manifest_fields(package: Mapping[str, str]) -> dict[str, str]:
             f'Compliance check: {package["compliance_check"]}'
         ),
     }
-
-
-def find_on_screen_text_mismatches(
-    package: Mapping[str, str],
-) -> list[tuple[str, str]]:
-    """Return field pairs whose exact on-screen text is absent from the prompt."""
-
-    return [
-        (text_field, prompt_field)
-        for text_field, prompt_field in ON_SCREEN_TEXT_PROMPT_PAIRS
-        if package[text_field] not in package[prompt_field]
-    ]
 
 
 def validate_creative_manifest(
@@ -300,33 +317,24 @@ def _message_text(message: Any) -> str:
 def _log_package_warnings(
     job_id: str, clip_id: str, package: Mapping[str, str]
 ) -> None:
-    for text_field, prompt_field in find_on_screen_text_mismatches(package):
+    hook_chars = len(package["hook_text"])
+    if hook_chars > HOOK_TEXT_MAX_CHARS:
         logger.warning(
-            "creative[%s]: clip=%s on-screen text mismatch: %s=%r | %s=%r",
+            "creative[%s]: clip=%s hook_text is %d chars (max %d)",
             job_id,
             clip_id,
-            text_field,
-            package[text_field],
-            prompt_field,
-            package[prompt_field],
+            hook_chars,
+            HOOK_TEXT_MAX_CHARS,
         )
 
-    hook_words = len(package["hook_on_screen_text"].split())
-    if hook_words > 6:
+    close_chars = len(package["close_text"])
+    if close_chars > CLOSE_TEXT_MAX_CHARS:
         logger.warning(
-            "creative[%s]: clip=%s hook on-screen text has %d words (max 6)",
+            "creative[%s]: clip=%s close_text is %d chars (max %d)",
             job_id,
             clip_id,
-            hook_words,
-        )
-
-    close_words = len(package["close_on_screen_text"].split())
-    if close_words > 7:
-        logger.warning(
-            "creative[%s]: clip=%s close on-screen text has %d words (max 7)",
-            job_id,
-            clip_id,
-            close_words,
+            close_chars,
+            CLOSE_TEXT_MAX_CHARS,
         )
 
     compliance = package["compliance_check"]

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast
 
 from worker import higgsfield, jobs
 from worker.higgsfield import GenerationParams, GenerationResult
+from worker.lint import lint_prompts
 
 if TYPE_CHECKING:
     from psycopg import Connection
@@ -106,6 +107,25 @@ def run_generate(ctx: GenerateStageContext) -> None:
     """Generate all missing approved assets and synchronize the final manifest."""
 
     manifest, clips = validate_generate_manifest(ctx.job.manifest)
+
+    # Enforcement choke point #2: re-lint the approved prompts before ANY
+    # Higgsfield call (balance/preflight/generation). This catches
+    # human-edited prompts and stale pre-v2 manifests — whose prompts embedded
+    # on-screen text and branding — so no credits are ever spent generating
+    # footage that would hallucinate fake logos. Regenerating creative (v2)
+    # produces clean prompts and clears the violations.
+    violations = lint_prompts(manifest)
+    if violations:
+        detail = "; ".join(
+            f"{v['clipId']}.{v['field']} matched {v['matched_word']!r} "
+            f"in {v['prompt_excerpt']!r}"
+            for v in violations
+        )
+        raise GenerateError(
+            f"generate: {len(violations)} generation-prompt lint violation(s) "
+            f"block generation; regenerate creative to clear them: {detail}"
+        )
+
     preflight = _preflight(clips)
     available = higgsfield.balance()
     if available < preflight.total:

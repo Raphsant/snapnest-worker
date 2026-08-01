@@ -241,6 +241,38 @@ def test_preflight_insufficient_balance_never_generates(
     assert harness.heartbeats == []
 
 
+def test_lint_violation_blocks_generation_before_any_higgsfield_call(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest()
+    manifest["clips"][0]["hook_prompt"] = (
+        "Push in on the STC logo, bottom-right."
+    )
+    harness = _harness(monkeypatch, tmp_path, manifest)
+
+    balance = Mock()
+    get_cost = Mock()
+    generate = Mock()
+    monkeypatch.setattr("worker.stages.generate.higgsfield.balance", balance)
+    monkeypatch.setattr("worker.stages.generate.higgsfield.get_cost", get_cost)
+    monkeypatch.setattr("worker.stages.generate.higgsfield.generate", generate)
+
+    with pytest.raises(GenerateError) as raised:
+        harness.run()
+
+    message = str(raised.value)
+    assert "lint violation" in message
+    assert f"{CLIP_ID}.hook_prompt" in message
+    assert "logo" in message.lower()
+    # Not a single Higgsfield call — not even the balance check — was made.
+    balance.assert_not_called()
+    get_cost.assert_not_called()
+    generate.assert_not_called()
+    assert harness.db.checkpoints == []
+    assert harness.heartbeats == []
+
+
 def test_resume_skips_checkpointed_hook(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
