@@ -1,0 +1,65 @@
+# Dockge-ready compose for the STC Zombie Hour pipeline worker.
+#
+# This file contains NO credentials — every secret comes from .env via
+# `env_file` (Dockge renders compose content in its UI, so it stays clean).
+#
+# Deploy model: the repo is checked out on the host with this file at its root,
+# so `build.context: .` builds the image from source — nothing that can't be
+# rebuilt from the repo is baked in. See DEPLOY.md for the one-time setup.
+
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: snapnest-worker:latest
+    container_name: snapnest-worker
+    # 24/7 worker: come back after a crash or a host reboot, but stay down if
+    # an operator deliberately stops it.
+    restart: unless-stopped
+
+    # No ports. The worker is a single-threaded SQS long-poll loop with no
+    # inbound network surface.
+
+    env_file:
+      - .env
+
+    volumes:
+      # --- Higgsfield CLI credentials — READ-WRITE (mandatory) ---
+      # The CLI refreshes credentials.json IN PLACE on token refresh, so this
+      # mount must be writable. A read-only mount (or COPYing the files into the
+      # image) works exactly once and then breaks on the first refresh.
+      #
+      # One-time host setup (see DEPLOY.md), the dir must be:
+      #   owned by the container user  ->  UID 10001, GID 10001
+      #   dir mode 700, files 600
+      #   seeded with config.json + credentials.json from ~/.config/higgsfield
+      #   on the Mac (SKIP the .lock file).
+      #
+      # Path is relative to this compose file (the Dockge stack dir). Swap in an
+      # absolute host path if you keep credentials outside the stack dir.
+      - ./higgsfield-config:/home/worker/.config/higgsfield
+
+      # --- Per-job scratch (yt-dlp downloads, ffmpeg intermediates, generated
+      # assets) ---
+      # Ephemeral: each <jobId> dir is deleted when its job finishes. But it is
+      # multi-GB while a job runs, so it lives on its own named volume you can
+      # relocate or cap independently of the container. The mount point matches
+      # the image's JOB_WORKSPACE_ROOT default (/var/lib/snapnest/jobs).
+      - snapnest-jobs:/var/lib/snapnest/jobs
+      # TrueNAS alternative — bind scratch onto a specific pool/dataset instead
+      # of the named volume above (comment out the volume line if you use this):
+      # - /mnt/tank/apps/snapnest-worker/jobs:/var/lib/snapnest/jobs
+
+    # Logs: the worker writes to the container's stderr (Python logging), which
+    # the default json-file driver captures — visible via `docker logs` and in
+    # Dockge. Defaults are fine. Uncomment to cap log disk usage on a long-lived
+    # worker:
+    # logging:
+    #   driver: json-file
+    #   options:
+    #     max-size: "10m"
+    #     max-file: "5"
+
+volumes:
+  snapnest-jobs:

@@ -1,0 +1,44 @@
+# Keep the build context small and secret-free. The Dockerfile only COPYs
+# pyproject.toml, uv.lock, and worker/ (which includes worker/fonts/ and
+# worker/prompts/) — everything matched here is excluded so it can never bloat
+# the context or leak into an image layer.
+
+# --- Secrets / deploy state (MUST never enter an image) ---
+.env
+.env.*
+!.env.example
+higgsfield-config/
+**/credentials.json
+
+# --- Version control & editor/IDE ---
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# --- Python virtualenvs & caches ---
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# --- OS cruft ---
+.DS_Store
+**/.DS_Store
+
+# --- Test media, scratch, local artifacts (not needed to build/run) ---
+*.mp4
+**/*.mp4
+clip_*_manifest.json
+tests/
+jobs/
+
+# --- Deploy docs not needed inside the image ---
+DEPLOY.md
+docker-compose.yml

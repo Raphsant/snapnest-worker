@@ -1,5 +1,7 @@
 # Secrets / local env
 .env
+# Higgsfield credentials bind-mount (seeded on the host; see DEPLOY.md).
+higgsfield-config/
 
 # Python
 __pycache__/
@@ -16,3 +18,7 @@ dist/
 
 # Worker scratch space
 /tmp/jobs/
+
+# macOS
+.DS_Store
+**/.DS_Store
