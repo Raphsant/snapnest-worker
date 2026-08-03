@@ -22,8 +22,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
+from typing import TypeVar
 
 import boto3
+import psycopg
 
 from worker import jobs
 from worker.config import Config, ConfigError, load_config
@@ -36,6 +38,8 @@ from worker.workspace import Workspace
 logger = logging.getLogger(__name__)
 
 CHECKPOINT_VISIBILITY_TIMEOUT_S = 3600
+
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -128,6 +132,38 @@ class Worker:
     def request_shutdown(self) -> None:
         self._shutdown.set()
 
+    def _reconnect(self) -> None:
+        """Discard the current DB connection and open a fresh one."""
+
+        try:
+            self._conn.close()
+        except Exception:
+            logger.debug(
+                "Ignoring error while closing a stale DB connection", exc_info=True
+            )
+        self._conn = connect(self._config.database_url)
+
+    def _db_operation(self, operation: Callable[[], T]) -> T:
+        """Run a DB operation, reconnecting and retrying it ONCE on a dead connection.
+
+        A connection left idle for days can be dead by the first query after the
+        gap (production hit ``SSL error: unexpected eof while reading``). TCP
+        keepalives prevent most of these; this is the backstop for the rest. A
+        second failure is allowed to propagate — the container restart policy is
+        the final backstop, so we never loop.
+        """
+
+        try:
+            return operation()
+        except psycopg.OperationalError:
+            logger.warning(
+                "DB operation failed on a stale connection; "
+                "reconnecting and retrying once",
+                exc_info=True,
+            )
+            self._reconnect()
+            return operation()
+
     def run(self) -> None:
         logger.info("Worker started; polling %s", self._config.pipeline_queue_url)
         try:
@@ -156,7 +192,10 @@ class Worker:
             return
 
         job_id = parsed.job_id
-        job = jobs.load_job(self._conn, job_id)
+        # First DB touch per message. A connection idle since the last message
+        # may be dead; reconnect-and-retry once so we don't crash and wait out
+        # the SQS visibility timeout.
+        job = self._db_operation(lambda: jobs.load_job(self._conn, job_id))
         if job is None:
             # A missing job is now always a bug or a transient (e.g. the row
             # isn't committed/visible yet), never a reason to destroy the

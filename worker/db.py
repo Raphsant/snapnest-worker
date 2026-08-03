@@ -20,9 +20,23 @@ Params = Sequence[Any] | None
 
 
 def connect(database_url: str) -> Connection[DictRow]:
-    """Open an autocommit connection that yields dict rows."""
+    """Open an autocommit connection that yields dict rows.
 
-    return psycopg.connect(database_url, autocommit=True, row_factory=dict_row)
+    TCP keepalives are passed as psycopg connect kwargs (deliberately NOT baked
+    into DATABASE_URL) so a long-idle connection is probed and kept alive rather
+    than silently dying: the worker sat idle for two days and the first query
+    after the gap failed with 'SSL error: unexpected eof while reading'.
+    """
+
+    return psycopg.connect(
+        database_url,
+        autocommit=True,
+        row_factory=dict_row,
+        keepalives=1,
+        keepalives_idle=60,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
 
 
 def fetch_one(

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import Mock
 
+import psycopg
 import pytest
 
 from worker.jobs import Job
@@ -215,3 +217,83 @@ def test_resolve_entry_stage_never_reroutes_explicit_stage() -> None:
 def test_needs_download_predicate() -> None:
     assert _needs_download(_youtube_job("QUEUED")) is True
     assert _needs_download(_job("QUEUED")) is False
+
+
+# --- stale-connection reconnect + retry ------------------------------------ #
+
+
+def _reconnect_worker(stale_conn: object, fresh_conn: object) -> Worker:
+    """A Worker with a controllable DB conn and a connect() that returns fresh_conn."""
+
+    worker = Worker.__new__(Worker)
+    untyped = cast(Any, worker)
+    untyped._conn = stale_conn
+    untyped._config = SimpleNamespace(database_url="postgresql://test")
+    return worker
+
+
+def test_db_operation_reconnects_and_retries_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale_conn = Mock(name="stale_conn")
+    fresh_conn = Mock(name="fresh_conn")
+    worker = _reconnect_worker(stale_conn, fresh_conn)
+    monkeypatch.setattr("worker.main.connect", lambda url: fresh_conn)
+
+    seen: list[object] = []
+
+    def operation() -> str:
+        seen.append(worker._conn)
+        if len(seen) == 1:
+            raise psycopg.OperationalError("SSL error: unexpected eof while reading")
+        return "ok"
+
+    result = worker._db_operation(operation)
+
+    assert result == "ok"
+    # Ran once on the dead conn, then once on the freshly reopened one.
+    assert seen == [stale_conn, fresh_conn]
+    stale_conn.close.assert_called_once()
+    assert worker._conn is fresh_conn
+
+
+def test_db_operation_second_failure_propagates_without_looping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = _reconnect_worker(Mock(name="stale_conn"), Mock(name="fresh_conn"))
+    monkeypatch.setattr("worker.main.connect", lambda url: Mock(name="fresh_conn"))
+
+    attempts = 0
+
+    def operation() -> str:
+        nonlocal attempts
+        attempts += 1
+        raise psycopg.OperationalError("still down")
+
+    with pytest.raises(psycopg.OperationalError):
+        worker._db_operation(operation)
+
+    # Original attempt + exactly one retry — no loop.
+    assert attempts == 2
+
+
+def test_db_operation_success_does_not_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_conn = Mock(name="conn")
+    worker = _reconnect_worker(original_conn, Mock(name="fresh_conn"))
+    reconnected = False
+
+    def fake_connect(url: str) -> object:
+        nonlocal reconnected
+        reconnected = True
+        return Mock()
+
+    monkeypatch.setattr("worker.main.connect", fake_connect)
+
+    result = worker._db_operation(lambda: "ok")
+
+    assert result == "ok"
+    assert reconnected is False
+    assert worker._conn is original_conn
+    original_conn.close.assert_not_called()
