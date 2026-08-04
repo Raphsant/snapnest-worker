@@ -92,17 +92,28 @@ def run_creative(ctx: StageContext) -> None:
     # violations in the manifest so the operator sees them in the dashboard and
     # rejects/regenerates. This state fires ZERO Higgsfield calls; the generate
     # stage re-lints and hard-fails before spending credits (worker.lint).
-    violations = lint_prompts(manifest)
-    manifest["lint_violations"] = violations
-    if violations:
+    lint = lint_prompts(manifest)
+    manifest["lint_violations"] = lint.violations
+    manifest["lint_warnings"] = lint.warnings
+    if lint.violations:
         logger.warning(
             "creative[%s]: %d generation-prompt lint violation(s) recorded "
             "for operator review: %s",
             ctx.job.id,
-            len(violations),
+            len(lint.violations),
             "; ".join(
                 f"{v['clipId']}.{v['field']} matched {v['matched_word']!r}"
-                for v in violations
+                for v in lint.violations
+            ),
+        )
+    if lint.warnings:
+        logger.info(
+            "creative[%s]: %d negated lint warning(s) recorded (non-blocking): %s",
+            ctx.job.id,
+            len(lint.warnings),
+            "; ".join(
+                f"{w['clipId']}.{w['field']} matched {w['matched_word']!r}"
+                for w in lint.warnings
             ),
         )
 

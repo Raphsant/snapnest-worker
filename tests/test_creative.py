@@ -279,3 +279,26 @@ def test_run_creative_records_lint_violations_at_the_gate(
     # Recorded for operator review, NOT raised: the job still parks at the
     # creative gate with the native overlay text in place.
     assert saved["clips"][0]["hook_text"] == "TRATA EL TRADING EN SERIO"
+
+
+def test_run_creative_records_negated_lint_warnings_at_the_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # A negated branding word is recorded as a non-blocking warning, not a
+    # blocking violation — so creative v2's "no logos" phrasings don't wedge.
+    negated = _package()
+    negated["hook_prompt"] = "Clean trading floor, no logos, plain background."
+
+    saved, _ = _run_creative_capture(
+        monkeypatch,
+        tmp_path,
+        manifest=_approved_manifest(),
+        package=negated,
+    )
+
+    assert saved["lint_violations"] == []
+    warnings = saved["lint_warnings"]
+    assert {w["field"] for w in warnings} == {"hook_prompt"}
+    assert {w["matched_word"].lower() for w in warnings} == {"logos"}
+    assert all(w["negated"] is True for w in warnings)

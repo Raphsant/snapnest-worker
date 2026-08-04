@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -271,6 +272,29 @@ def test_lint_violation_blocks_generation_before_any_higgsfield_call(
     generate.assert_not_called()
     assert harness.db.checkpoints == []
     assert harness.heartbeats == []
+
+
+def test_negated_lint_warning_does_not_block_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A negated branding word ("no logos") is a non-blocking WARNING — unlike a
+    # naked one, it must NOT stop generation.
+    manifest = _manifest()
+    manifest["clips"][0]["hook_prompt"] = (
+        "Clean trading desk, no logos, plain background."
+    )
+    harness = _harness(monkeypatch, tmp_path, manifest)
+    _install_costs_and_balance(monkeypatch, balance=1000)
+    generation_calls = _install_successful_generation(monkeypatch)
+
+    with caplog.at_level(logging.INFO):
+        harness.run()  # must NOT raise a lint GenerateError
+
+    # It got past the lint gate into real generation, and logged the warning.
+    assert generation_calls
+    assert "negated lint warning" in caplog.text
 
 
 def test_resume_skips_checkpointed_hook(

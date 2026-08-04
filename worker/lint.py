@@ -8,6 +8,11 @@ enforcement layer, wired at two choke points: the creative stage surfaces
 violations in the manifest for operator review, and the generate stage
 hard-fails the job before any credit-bearing Higgsfield call.
 
+Negation-aware (v1.1): a blocklisted word used inside a prohibition ("no logos",
+"free of text") is a non-blocking WARNING, not a violation — so prompts that
+describe cleanliness by naming what to avoid don't hard-fail. "STC" is the
+exception: the letters appearing at all is the violation, even negated.
+
 Pure functions only — no DB, S3, Anthropic, or Higgsfield side effects.
 """
 
@@ -15,6 +20,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 # Only generation-prompt fields are linted. hook_text / close_text are overlay
@@ -63,22 +69,58 @@ _BLOCKLIST_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Negation cues that flip a blocklist hit from a request into a prohibition. A
+# hit is NEGATED when one of these appears within NEGATION_LOOKBACK_WORDS words
+# before it, in the same sentence: "no logos", "without any text", "free of
+# branding". Negated hits are warnings, never blocks — EXCEPT "STC", whose mere
+# appearance is the violation in any polarity.
+_NEGATION_WORDS: frozenset[str] = frozenset(
+    {"no", "not", "without", "never", "avoid"}
+)
+_NEGATION_PHRASES: frozenset[tuple[str, str]] = frozenset(
+    {("free", "of"), ("instead", "of")}
+)
+NEGATION_LOOKBACK_WORDS = 3
 
-def lint_prompts(manifest: Mapping[str, Any]) -> list[dict[str, str]]:
-    """Return blocklist violations in approved clips' generation-prompt fields.
+# Sentence boundaries so a cue can't leak across "." / "!" / "?" / newline, and
+# word tokens for the small look-back window before a match.
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?\n]")
+_WORD_RE = re.compile(r"[A-Za-z]+")
 
-    Each violation is ``{clipId, field, matched_word, prompt_excerpt}``. Only
-    approved clips are scanned, and only ``GENERATION_PROMPT_FIELDS`` — the
+
+@dataclass(frozen=True)
+class LintResult:
+    """Split lint outcome for approved clips' generation prompts.
+
+    ``violations`` block: naked blocklist hits, plus any "STC" in any polarity.
+    ``warnings`` are negated hits — a blocklisted word inside a prohibition ("no
+    logos", "free of text") — surfaced for review but never blocking; each has
+    the same shape as a violation plus ``negated: True``.
+    """
+
+    violations: list[dict[str, str]]
+    warnings: list[dict[str, Any]]
+
+
+def lint_prompts(manifest: Mapping[str, Any]) -> LintResult:
+    """Return blocking violations and negated warnings for approved clips' prompts.
+
+    A blocking ``violation`` is ``{clipId, field, matched_word, prompt_excerpt}``
+    (naked blocklist hits, plus any "STC"); the generate stage hard-fails on
+    these. A ``warning`` has the same shape plus ``negated: True`` (a blocklisted
+    word used inside a prohibition); it is surfaced but never blocks. Only
+    approved clips and only ``GENERATION_PROMPT_FIELDS`` are scanned — the
     hook_text / close_text overlay copy is intentionally exempt. A structurally
-    unusable manifest (no clips list) yields no violations; structural
+    unusable manifest (no clips list) yields an empty result; structural
     validation is the calling stage's responsibility, not the lint's.
     """
 
     clips = manifest.get("clips")
     if not isinstance(clips, list):
-        return []
+        return LintResult(violations=[], warnings=[])
 
     violations: list[dict[str, str]] = []
+    warnings: list[dict[str, Any]] = []
     for clip in clips:
         if not isinstance(clip, Mapping):
             continue
@@ -89,7 +131,8 @@ def lint_prompts(manifest: Mapping[str, Any]) -> list[dict[str, str]]:
             value = clip.get(field)
             if not isinstance(value, str):
                 continue
-            for matched_word, excerpt in _scan(value):
+            blocking, negated = _scan(value)
+            for matched_word, excerpt in blocking:
                 violations.append(
                     {
                         "clipId": clip_id,
@@ -98,25 +141,55 @@ def lint_prompts(manifest: Mapping[str, Any]) -> list[dict[str, str]]:
                         "prompt_excerpt": excerpt,
                     }
                 )
-    return violations
+            for matched_word, excerpt in negated:
+                warnings.append(
+                    {
+                        "clipId": clip_id,
+                        "field": field,
+                        "matched_word": matched_word,
+                        "prompt_excerpt": excerpt,
+                        "negated": True,
+                    }
+                )
+    return LintResult(violations=violations, warnings=warnings)
 
 
-def _scan(prompt: str) -> list[tuple[str, str]]:
-    """Return (matched_word, excerpt) once per distinct blocklisted word.
+def _scan(prompt: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Split a prompt's distinct blocklist hits into (blocking, negated) matches.
 
-    Repeated hits on the same word (case-insensitively) collapse to their first
-    occurrence, so a prompt that says "logo" three times reports one violation.
+    One entry per distinct blocklisted word (case-insensitively). A word blocks
+    if ANY of its occurrences is naked — so a naked request is never masked by an
+    earlier negated mention of the same word — and is a negated warning only if
+    EVERY occurrence is negated. "STC" always blocks, in any polarity: the
+    letters appearing at all is the violation, even in "no STC".
     """
 
-    found: dict[str, tuple[str, str]] = {}
+    blocking: dict[str, tuple[str, str]] = {}
+    negated: dict[str, tuple[str, str]] = {}
     for match in _BLOCKLIST_RE.finditer(prompt):
         key = match.group(0).lower()
-        if key not in found:
-            found[key] = (
-                match.group(0),
-                _excerpt(prompt, match.start(), match.end()),
-            )
-    return list(found.values())
+        entry = (match.group(0), _excerpt(prompt, match.start(), match.end()))
+        if key != "stc" and _is_negated(prompt, match.start()):
+            # Only record as negated if no naked hit for this word blocks already.
+            if key not in blocking:
+                negated.setdefault(key, entry)
+        else:
+            # Naked (or STC): this word blocks; drop any earlier negated entry.
+            negated.pop(key, None)
+            blocking.setdefault(key, entry)
+    return list(blocking.values()), list(negated.values())
+
+
+def _is_negated(prompt: str, start: int) -> bool:
+    """True if a negation cue sits within NEGATION_LOOKBACK_WORDS words before the
+    match, without crossing a sentence boundary."""
+
+    sentence = _SENTENCE_SPLIT_RE.split(prompt[:start])[-1]
+    window = [word.lower() for word in _WORD_RE.findall(sentence)]
+    window = window[-NEGATION_LOOKBACK_WORDS:]
+    if any(word in _NEGATION_WORDS for word in window):
+        return True
+    return any(pair in _NEGATION_PHRASES for pair in zip(window, window[1:]))
 
 
 def _excerpt(prompt: str, start: int, end: int) -> str:

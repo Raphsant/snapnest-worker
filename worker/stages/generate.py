@@ -114,16 +114,28 @@ def run_generate(ctx: GenerateStageContext) -> None:
     # on-screen text and branding — so no credits are ever spent generating
     # footage that would hallucinate fake logos. Regenerating creative (v2)
     # produces clean prompts and clears the violations.
-    violations = lint_prompts(manifest)
-    if violations:
+    lint = lint_prompts(manifest)
+    if lint.violations:
         detail = "; ".join(
             f"{v['clipId']}.{v['field']} matched {v['matched_word']!r} "
             f"in {v['prompt_excerpt']!r}"
-            for v in violations
+            for v in lint.violations
         )
         raise GenerateError(
-            f"generate: {len(violations)} generation-prompt lint violation(s) "
+            f"generate: {len(lint.violations)} generation-prompt lint violation(s) "
             f"block generation; regenerate creative to clear them: {detail}"
+        )
+    if lint.warnings:
+        # Negated branding words ("no logos", "free of text") are non-blocking:
+        # the assembler owns branding, so a prompt that merely names what to
+        # avoid is safe. Log for visibility and proceed to generation.
+        logger.info(
+            "generate: %d negated lint warning(s), non-blocking: %s",
+            len(lint.warnings),
+            "; ".join(
+                f"{w['clipId']}.{w['field']} matched {w['matched_word']!r}"
+                for w in lint.warnings
+            ),
         )
 
     preflight = _preflight(clips)

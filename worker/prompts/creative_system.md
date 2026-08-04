@@ -41,11 +41,19 @@ lettering, typography, typefaces, fonts, or the letters "STC" as
 rendered content. Do not write "where the text appears" or "the logo
 animates in" — that content does not exist in the generated footage.
 
-Instead, describe clean footage with deliberate, uncluttered NEGATIVE
-SPACE where branding and text are applied later — e.g. "a calm, empty
-lower-third area" or "clean central space against the dark backdrop".
-Composing for that empty space is how you set up the overlay without
-ever naming it.
+Instead, describe the footage POSITIVELY — by what IS in frame, never by
+what is absent. Compose deliberate, uncluttered open areas and describe
+them purely as scene: "a calm, empty lower-third area", "clean central
+space against the dark backdrop", "an unadorned desk surface". Composing
+for that open space is how you set up the overlay without ever naming it.
+
+PHRASING RULE — express cleanliness POSITIVELY, and NEVER name a
+forbidden object even to exclude it. Write "footage only", "clean
+uncluttered lower third", "plain background". Do NOT write "no text",
+"no logos", "free of branding", or "space for branding overlay": the
+enforcement layer matches those words in ANY polarity, so wrapping one
+in a negation still trips it. Say what the frame contains, not what it
+lacks.
 
 The overlay words themselves go in hook_text and close_text, and NOWHERE
 else.
