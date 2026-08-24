@@ -6,6 +6,7 @@ import copy
 import json
 import logging
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -997,6 +998,19 @@ def _process_clip(
             "bridge_in": None,
             "bridge_out": None,
         }
+        # A None overlay means the manifest field was empty/absent, so this
+        # segment gets no drawtext. Log it -- a silent drop here masqueraded as
+        # a rendering bug and cost a full day to trace.
+        overlay_assets: tuple[AssetName, ...] = ("hook", "outro")
+        for overlay_asset in overlay_assets:
+            if overlays[overlay_asset] is None:
+                logger.info(
+                    "assemble[%s]: clip=%s asset=%s no overlay text; "
+                    "skipping drawtext",
+                    ctx.job.id,
+                    clip.clip_id,
+                    overlay_asset,
+                )
         normalized: dict[AssetName, Path] = {}
         speeds: dict[AssetName, float] = {
             "hook": CONFIG["hook_speed"],
@@ -1290,6 +1304,12 @@ def _drawtext_filter(text: TextOverlay) -> str:
     return (
         f"drawtext=fontfile='{_escape_filter_value(style['fontfile'])}':"
         f"textfile='{_escape_filter_value(str(text.textfile))}':"
+        # Render the textfile bytes literally. drawtext's default
+        # expansion=normal treats a bare '%' (e.g. hook_text 'PUEDES PERDER
+        # 80%') as a malformed %{...} token and silently renders an EMPTY
+        # frame -- ffmpeg exits 0, encodes, and writes nothing to stderr. We
+        # emit no %{...} features, so literal rendering is the correct semantic.
+        "expansion=none:"
         f"fontsize={style['fontsize']}:"
         f"fontcolor={style['fontcolor']}:"
         f"borderw={style['borderw']}:"
@@ -1370,6 +1390,7 @@ def _probe_duration(source: Path, *, description: str) -> float:
 
 
 def _run_ffmpeg(command: list[str], *, description: str) -> str:
+    logger.info("assemble: %s ffmpeg argv: %s", description, shlex.join(command))
     process = subprocess.run(
         command,
         capture_output=True,

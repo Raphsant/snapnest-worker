@@ -794,10 +794,14 @@ def test_generated_segment_command_burns_hook_text_argv(tmp_path: Path) -> None:
         "setpts=PTS/1.5,fps=30,"
         f"drawtext=fontfile='{CONFIG['hook_overlay']['fontfile']}':"
         f"textfile='{textfile}':"
+        "expansion=none:"
         "fontsize=72:fontcolor=white:borderw=4:bordercolor=black:"
         "x=(w-text_w)/2:y=h*0.72:enable='gte(t\\,0.5)',"
         "format=yuv420p,setsar=1[v]"
     )
+    # expansion=none renders the textfile bytes literally (a bare '%' otherwise
+    # blanks the frame under drawtext's default expansion=normal).
+    assert "expansion=none" in command[filter_index]
     # Everything around the filter graph is byte-identical to the v1 command.
     v1_command = build_generated_segment_command(
         source, output, speed=CONFIG["hook_speed"]
@@ -831,10 +835,13 @@ def test_outro_segment_command_burns_close_text_above_logo_argv(
         "[base][logo]overlay=(W-w)/2:120:eof_action=repeat,"
         f"drawtext=fontfile='{CONFIG['close_overlay']['fontfile']}':"
         f"textfile='{textfile}':"
+        "expansion=none:"
         "fontsize=72:fontcolor=white:borderw=4:bordercolor=black:"
         "x=(w-text_w)/2:y=h*0.72:enable='gte(t\\,2.5)',"
         "format=yuv420p,setsar=1[v]"
     )
+    # Shared builder -> the close path carries expansion=none too.
+    assert "expansion=none" in command[filter_index]
 
 
 def test_overlay_textfile_preserves_manifest_bytes(tmp_path: Path) -> None:
@@ -854,6 +861,35 @@ def test_overlay_textfile_preserves_manifest_bytes(tmp_path: Path) -> None:
         )
         is None
     )
+
+
+def test_hook_text_with_percent_renders_literally(tmp_path: Path) -> None:
+    # Regression for the production hook_text 'PUEDES PERDER 80%': drawtext's
+    # default expansion=normal reads a bare '%' as a malformed %{...} token and
+    # silently renders an EMPTY frame (ffmpeg exits 0, no stderr). The builder
+    # now emits expansion=none, and the text still comes from textfile= so the
+    # '%' never reaches the filter-graph parser.
+    text = "PUEDES PERDER 80%"
+
+    overlay = assemble._write_overlay_textfile(
+        tmp_path, "hook_text", text, CONFIG["hook_overlay"]
+    )
+    assert overlay is not None
+    # The literal text -- including the bare '%' -- is written unmodified.
+    assert overlay.textfile.read_bytes() == text.encode("utf-8")
+    assert overlay.textfile.read_bytes() == b"PUEDES PERDER 80%"
+
+    command = build_generated_segment_command(
+        tmp_path / "hook.mp4",
+        tmp_path / "hook_normalized.mp4",
+        speed=CONFIG["hook_speed"],
+        text=overlay,
+    )
+    filter_string = command[command.index("-filter_complex") + 1]
+    assert "expansion=none" in filter_string
+    # Text stays in the file, not inlined into the filter graph.
+    assert f"textfile='{overlay.textfile}'" in filter_string
+    assert "80%" not in filter_string
 
 
 def test_boundary_fade_command_argv(tmp_path: Path) -> None:
