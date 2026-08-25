@@ -46,6 +46,10 @@ class Config:
     heartbeat_extension_seconds: int = 900
     job_workspace_root: str = "/tmp/jobs"
 
+    # Pre-generated asset library (hooks/outros). Key prefix inside S3_BUCKET;
+    # the catalog lives at "{library_prefix}catalog.json".
+    library_prefix: str = "library/"
+
     # AWS Transcribe (ingest stage). Vocabulary/filter are optional: an empty
     # string means "omit that setting" so we don't send a name Transcribe would
     # reject. The filter method is always "mask" (masked words become "***").
@@ -132,6 +136,7 @@ def load_config() -> Config:
         heartbeat_interval_seconds=_env_int(env, "HEARTBEAT_INTERVAL_SECONDS", 600),
         heartbeat_extension_seconds=_env_int(env, "HEARTBEAT_EXTENSION_SECONDS", 900),
         job_workspace_root=env.get("JOB_WORKSPACE_ROOT", "").strip() or "/tmp/jobs",
+        library_prefix=env.get("LIBRARY_PREFIX", "").strip() or "library/",
         transcribe_language=env.get("TRANSCRIBE_LANGUAGE", "").strip() or "es-US",
         transcribe_vocabulary=env.get("TRANSCRIBE_VOCABULARY", "").strip(),
         transcribe_filter=env.get("TRANSCRIBE_FILTER", "").strip(),
