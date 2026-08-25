@@ -1,4 +1,4 @@
-"""Assemble generated assets and approved clips into finished vertical shorts."""
+"""Assemble library assets and approved clips into finished vertical shorts."""
 
 from __future__ import annotations
 
@@ -18,19 +18,20 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypeVar, TypedDict, cast
 
 from worker import jobs
 from worker.artifacts import main_clip_key
+from worker.library import LibraryAsset, LibraryCatalog
 
 if TYPE_CHECKING:
     from psycopg import Connection
     from psycopg.rows import DictRow
 
+    from worker.config import Config
     from worker.jobs import Job
     from worker.workspace import Workspace
 
 logger = logging.getLogger(__name__)
 
-AssetName = Literal["hook", "outro", "bridge_in", "bridge_out"]
+AssetName = Literal["hook", "outro"]
 MainLayout = Literal["blur", "bars", "crop"]
-SegmentName = Literal["hook", "bridge_in", "main", "bridge_out", "outro"]
 
 # Bundled brand fonts live in worker/fonts/ (Iron Rule 5). Resolved relative to
 # the package so they load identically from source and inside the container (the
@@ -38,22 +39,6 @@ SegmentName = Literal["hook", "bridge_in", "main", "bridge_out", "outro"]
 #   Anton-Regular.ttf         -> hook_text drawtext overlay
 #   Montserrat-ExtraBold.ttf  -> captions (libass) + close_text drawtext overlay
 FONTS_DIR = Path(__file__).resolve().parents[1] / "fonts"
-ASSET_ORDER: tuple[AssetName, ...] = (
-    "hook",
-    "outro",
-    "bridge_in",
-    "bridge_out",
-)
-# (fade_in, fade_out) per concat segment: both sides of all four boundaries
-# dip to black; the video opens hard on the hook and the bed music's fade-out
-# closes the outro.
-BOUNDARY_FADE_SIDES: dict[SegmentName, tuple[bool, bool]] = {
-    "hook": (False, True),
-    "bridge_in": (True, True),
-    "main": (True, True),
-    "bridge_out": (True, True),
-    "outro": (True, False),
-}
 T = TypeVar("T")
 
 # Overlay text must never exceed the frame. The rendered width (glyph advance
@@ -98,15 +83,12 @@ class AssembleConfig(TypedDict):
     sample_aspect_ratio: int
     audio_sample_rate: int
     audio_layout: str
-    hook_speed: float
-    bridge_speed: float
-    outro_speed: float
     main_speed: float
     main_layout: MainLayout
     blur_radius: int
     blur_power: int
-    boundary_fade_seconds: float
-    bridge_out_tail_trim_seconds: float
+    xfade_hook_main_s: float
+    xfade_main_outro_s: float
     silence_threshold_db: float
     silence_min_duration_s: float
     silence_padding_s: float
@@ -144,17 +126,16 @@ CONFIG: AssembleConfig = {
     "sample_aspect_ratio": 1,
     "audio_sample_rate": 48000,
     "audio_layout": "stereo",
-    "hook_speed": 1.5,
-    "bridge_speed": 2.0,
-    "outro_speed": 1.5,
     "main_speed": 1.0,
     "main_layout": "blur",
     "blur_radius": 30,
     "blur_power": 1,
-    "boundary_fade_seconds": 0.25,
-    # The generated bridge_out's final frames stutter; drop this much off its
-    # tail before the boundary fade is applied (see _process_clip). 0 disables.
-    "bridge_out_tail_trim_seconds": 0.4,
+    # xfade join durations (validated on production footage): hook->main dips
+    # 0.25s, main->outro 0.5s. Offsets are computed from ffprobe'd durations
+    # of the normalized segments — never from catalog duration_s (a nominal
+    # 4s library asset measures ~4.04s).
+    "xfade_hook_main_s": 0.25,
+    "xfade_main_outro_s": 0.5,
     "silence_threshold_db": -35.0,
     "silence_min_duration_s": 0.8,
     "silence_padding_s": 0.15,
@@ -234,6 +215,7 @@ class AssembleStageContext(Protocol):
     job: Job
     workspace: Workspace
     conn: Connection[DictRow]
+    config: Config
     checkpoint_heartbeat: Callable[[], None]
 
 
@@ -261,7 +243,8 @@ class AssembleClip:
     end_ms: int
     start_block: int
     end_block: int
-    generated_keys: dict[AssetName, str]
+    hook_asset_id: str
+    outro_asset_id: str
     assembled: dict[str, str] | None
     hook_text: str | None
     close_text: str | None
@@ -291,7 +274,25 @@ def run_assemble(ctx: AssembleStageContext) -> None:
         description="authoritative DB manifest load",
     )
     manifest, srt_key, clips = validate_assemble_manifest(loaded)
-    _run_preflight(ctx, clips)
+    catalog = _load_catalog(ctx)
+
+    # Resolve every pending clip's selections up front: an unknown id or a
+    # type mismatch must fail before any download or ffmpeg work.
+    pending = [clip for clip in clips if clip.assembled is None]
+    resolved: dict[str, tuple[LibraryAsset, LibraryAsset]] = {}
+    for clip in pending:
+        hook_asset = _resolve_asset(
+            catalog, clip.clip_id, clip.hook_asset_id, "hook"
+        )
+        outro_asset = _resolve_asset(
+            catalog, clip.clip_id, clip.outro_asset_id, "outro"
+        )
+        resolved[clip.clip_id] = (hook_asset, outro_asset)
+    # All current library outros carry a baked logo; the overlay (and the logo
+    # fetch itself) only happens for an asset that says otherwise.
+    need_logo = any(not outro.logo_baked for _, outro in resolved.values())
+
+    _run_preflight(ctx, clips, include_logo=need_logo)
 
     master_path = _retry_once(
         lambda: ctx.workspace.download(srt_key, "assemble/master.srt"),
@@ -314,10 +315,22 @@ def run_assemble(ctx: AssembleStageContext) -> None:
         ),
         description=f"static asset download ({CONFIG['bed_music_key']})",
     )
-    logo = _retry_once(
-        lambda: ctx.workspace.download(CONFIG["logo_key"], "assemble/stc_logo.png"),
-        description=f"static asset download ({CONFIG['logo_key']})",
-    )
+    logo: Path | None = None
+    if need_logo:
+        logo = _retry_once(
+            lambda: ctx.workspace.download(
+                CONFIG["logo_key"], "assemble/stc_logo.png"
+            ),
+            description=f"static asset download ({CONFIG['logo_key']})",
+        )
+
+    # Library assets: each distinct asset is downloaded ONCE per job into the
+    # shared assemble/ dir, keyed by id; clips in the job share local copies.
+    library_files: dict[str, Path] = {}
+    for hook_asset, outro_asset in resolved.values():
+        for asset in (hook_asset, outro_asset):
+            if asset.id not in library_files:
+                library_files[asset.id] = _download_library_asset(ctx, asset)
 
     for clip in clips:
         if clip.assembled is not None:
@@ -327,6 +340,7 @@ def run_assemble(ctx: AssembleStageContext) -> None:
                 clip.clip_id,
             )
             continue
+        hook_asset, outro_asset = resolved[clip.clip_id]
         _process_clip(
             ctx,
             manifest,
@@ -334,6 +348,9 @@ def run_assemble(ctx: AssembleStageContext) -> None:
             clip_srts[clip.clip_id],
             bed_music,
             logo,
+            library_files,
+            hook_asset=hook_asset,
+            outro_asset=outro_asset,
         )
 
     authoritative = _retry_once(
@@ -420,17 +437,8 @@ def validate_assemble_manifest(
                 f"{start_block}-{end_block}"
             )
 
-        generated = clip.get("generated")
-        if not isinstance(generated, dict):
-            raise AssembleError(
-                f"assemble: clip {clip_id} missing generated asset package"
-            )
-        generated_map = cast(dict[str, object], generated)
-        generated_keys: dict[AssetName, str] = {}
-        for asset in ASSET_ORDER:
-            generated_keys[asset] = _generated_s3_key(
-                generated_map, clip_id, asset
-            )
+        hook_asset_id = _required_clip_string(clip, "hook_asset_id", index)
+        outro_asset_id = _required_clip_string(clip, "outro_asset_id", index)
 
         approved.append(
             AssembleClip(
@@ -440,7 +448,8 @@ def validate_assemble_manifest(
                 end_ms=end_ms,
                 start_block=start_block,
                 end_block=end_block,
-                generated_keys=generated_keys,
+                hook_asset_id=hook_asset_id,
+                outro_asset_id=outro_asset_id,
                 assembled=_assembled_checkpoint(clip, clip_id),
                 hook_text=_optional_clip_text(clip, "hook_text", index),
                 close_text=_optional_clip_text(clip, "close_text", index),
@@ -547,40 +556,39 @@ def format_srt_timestamp(milliseconds: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
 
 
-def build_generated_segment_command(
+def build_library_segment_command(
     source: Path,
     output: Path,
     *,
-    speed: float,
     logo: Path | None = None,
     text: TextOverlay | None = None,
 ) -> list[str]:
-    """Build a normalized, sped-up generated-segment command with silent audio."""
+    """Build a normalized library-segment command (video only, native pacing).
+
+    Library assets are authored at final pacing — no speed adjustment. Every
+    output here is an xfade input, so the chain must end in the shared
+    normalized tail (format, setsar=1, settb=AVTB): xfade rejects mismatched
+    timebases, and the 24fps library sources land on a different tb without
+    the explicit settb (a confirmed production failure mode).
+    """
 
     width = CONFIG["output_width"]
     height = CONFIG["output_height"]
-    fps = CONFIG["output_fps"]
     video_filters = (
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
-        f"setpts=PTS/{speed},fps={fps}"
+        f"fps={CONFIG['output_fps']}"
     )
     drawtext = "" if text is None else f",{_drawtext_filter(text)}"
     command = [CONFIG["ffmpeg_binary"], "-y", "-i", str(source)]
     if logo is None:
         command.extend(
             [
-                "-f",
-                "lavfi",
-                "-i",
-                _silent_audio_source(),
                 "-filter_complex",
                 f"[0:v]{video_filters}{drawtext},"
                 f"{_normalized_video_output()}[v]",
                 "-map",
                 "[v]",
-                "-map",
-                "1:a",
             ]
         )
     else:
@@ -589,10 +597,6 @@ def build_generated_segment_command(
             [
                 "-i",
                 str(logo),
-                "-f",
-                "lavfi",
-                "-i",
-                _silent_audio_source(),
                 "-filter_complex",
                 f"[0:v]{video_filters}[base];"
                 f"[1:v]scale={logo_width}:-1[logo];"
@@ -600,11 +604,9 @@ def build_generated_segment_command(
                 f"eof_action=repeat{drawtext},{_normalized_video_output()}[v]",
                 "-map",
                 "[v]",
-                "-map",
-                "2:a",
             ]
         )
-    command.extend(_encoding_args(output, shortest=True))
+    command.extend(_encoding_args(output, audio=False))
     return command
 
 
@@ -683,7 +685,7 @@ def build_main_caption_command(
         "-map",
         "[a]",
     ]
-    command.extend(_encoding_args(output, shortest=False))
+    command.extend(_encoding_args(output, audio=True))
     return command
 
 
@@ -769,7 +771,7 @@ def build_silence_cut_command(
         "-map",
         "[a]",
     ]
-    command.extend(_encoding_args(output, shortest=False))
+    command.extend(_encoding_args(output, audio=True))
     return command
 
 
@@ -788,137 +790,100 @@ def build_duration_probe_command(source: Path) -> list[str]:
     ]
 
 
-def build_boundary_fade_command(
-    source: Path,
-    output: Path,
-    *,
-    duration_s: float,
-    fade_in: bool,
-    fade_out: bool,
-) -> list[str]:
-    """Build the dip-to-black fade pass; audio passes through untouched."""
-
-    fade = CONFIG["boundary_fade_seconds"]
-    filters: list[str] = []
-    if fade_in:
-        filters.append(f"fade=t=in:st=0:d={fade}")
-    if fade_out:
-        start = max(0.0, duration_s - fade)
-        filters.append(f"fade=t=out:st={start:.6f}:d={fade}")
-    filters.append(_normalized_video_output())
-    return [
-        CONFIG["ffmpeg_binary"],
-        "-y",
-        "-i",
-        str(source),
-        "-vf",
-        ",".join(filters),
-        "-c:v",
-        CONFIG["video_codec"],
-        "-pix_fmt",
-        CONFIG["pixel_format"],
-        "-c:a",
-        "copy",
-        "-movflags",
-        "+faststart",
-        str(output),
-    ]
-
-
-def build_tail_trim_command(
-    source: Path,
-    output: Path,
-    *,
-    keep_duration_s: float,
-) -> list[str]:
-    """Build a command that keeps only the first ``keep_duration_s`` of a segment.
-
-    Used to drop the stuttering tail of the generated bridge_out before its
-    boundary fade. Video is re-encoded so the cut is frame-accurate; the silent
-    audio track is copied.
-    """
-
-    return [
-        CONFIG["ffmpeg_binary"],
-        "-y",
-        "-i",
-        str(source),
-        "-t",
-        f"{keep_duration_s:.6f}",
-        "-c:v",
-        CONFIG["video_codec"],
-        "-pix_fmt",
-        CONFIG["pixel_format"],
-        "-c:a",
-        "copy",
-        "-movflags",
-        "+faststart",
-        str(output),
-    ]
-
-
 def build_final_command(
-    segments: Sequence[Path],
+    hook: Path,
+    main: Path,
+    outro: Path,
     bed_music: Path,
     output: Path,
+    *,
+    hook_duration_s: float,
+    main_duration_s: float,
+    outro_duration_s: float,
 ) -> list[str]:
-    """Build the fixed-order concat plus full-duration bed-music mix."""
+    """Build the hook->main->outro xfade chain plus the delayed-voice bed mix.
 
-    command = [CONFIG["ffmpeg_binary"], "-y"]
-    for segment in segments:
-        command.extend(["-i", str(segment)])
-    command.extend(["-stream_loop", "-1", "-i", str(bed_music)])
+    Offsets come from the ffprobe'd durations of the normalized segment FILES
+    (never catalog duration_s). Main's voice is delayed to the start of the
+    hook->main crossfade and apad'ed; amix(duration=first) over the padded
+    voice runs long, so the output is clamped with -t to the exact total:
+    hook + main + outro - both xfade overlaps.
+    """
 
-    filters: list[str] = []
-    concat_inputs: list[str] = []
-    for index in range(len(segments)):
-        filters.append(f"[{index}:v]setpts=PTS-STARTPTS[v{index}]")
-        filters.append(f"[{index}:a]asetpts=PTS-STARTPTS[a{index}]")
-        concat_inputs.extend((f"[v{index}]", f"[a{index}]"))
-    filters.append(
-        "".join(concat_inputs)
-        + f"concat=n={len(segments)}:v=1:a=1[video][voice]"
+    fade_hook_main = CONFIG["xfade_hook_main_s"]
+    fade_main_outro = CONFIG["xfade_main_outro_s"]
+    offset_hook_main = hook_duration_s - fade_hook_main
+    offset_main_outro = (
+        hook_duration_s + main_duration_s - fade_hook_main - fade_main_outro
     )
-    bed_index = len(segments)
-    filters.append(
-        f"[{bed_index}:a]aformat=sample_rates={CONFIG['audio_sample_rate']}:"
+    total_s = (
+        hook_duration_s
+        + main_duration_s
+        + outro_duration_s
+        - fade_hook_main
+        - fade_main_outro
+    )
+    voice_delay_ms = round(offset_hook_main * 1000)
+
+    filters = [
+        # settb=AVTB on EVERY xfade input: xfade rejects mismatched timebases.
+        "[0:v]settb=AVTB[v0]",
+        "[1:v]settb=AVTB[v1]",
+        "[2:v]settb=AVTB[v2]",
+        f"[v0][v1]xfade=transition=fade:duration={fade_hook_main}:"
+        f"offset={offset_hook_main:.6f}[vx]",
+        f"[vx][v2]xfade=transition=fade:duration={fade_main_outro}:"
+        f"offset={offset_main_outro:.6f}[video]",
+        f"[1:a]adelay={voice_delay_ms}|{voice_delay_ms},apad[voice]",
+        f"[3:a]aformat=sample_rates={CONFIG['audio_sample_rate']}:"
         f"channel_layouts={CONFIG['audio_layout']},"
-        f"volume={CONFIG['bed_volume']}[bed]"
-    )
-    filters.append(
+        f"volume={CONFIG['bed_volume']}[bed]",
         "[voice][bed]amix=inputs=2:duration=first:normalize=0:"
         "dropout_transition=0,"
         "areverse,"
         f"afade=t=in:d={CONFIG['bed_fade_out_s']},"
-        "areverse,asetpts=N/SR/TB[audio]"
-    )
-    command.extend(
-        [
-            "-filter_complex",
-            ";".join(filters),
-            "-map",
-            "[video]",
-            "-map",
-            "[audio]",
-            "-c:v",
-            CONFIG["video_codec"],
-            "-pix_fmt",
-            CONFIG["pixel_format"],
-            "-r",
-            str(CONFIG["output_fps"]),
-            "-c:a",
-            CONFIG["audio_codec"],
-            "-movflags",
-            "+faststart",
-            str(output),
-        ]
-    )
-    return command
+        "areverse,asetpts=N/SR/TB[audio]",
+    ]
+    return [
+        CONFIG["ffmpeg_binary"],
+        "-y",
+        "-i",
+        str(hook),
+        "-i",
+        str(main),
+        "-i",
+        str(outro),
+        "-stream_loop",
+        "-1",
+        "-i",
+        str(bed_music),
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        "[video]",
+        "-map",
+        "[audio]",
+        "-t",
+        f"{total_s:.6f}",
+        "-c:v",
+        CONFIG["video_codec"],
+        "-pix_fmt",
+        CONFIG["pixel_format"],
+        "-r",
+        str(CONFIG["output_fps"]),
+        "-c:a",
+        CONFIG["audio_codec"],
+        "-movflags",
+        "+faststart",
+        str(output),
+    ]
 
 
 def _run_preflight(
     ctx: AssembleStageContext,
     clips: Sequence[AssembleClip],
+    *,
+    include_logo: bool,
 ) -> None:
     executable = CONFIG["ffmpeg_binary"]
     if shutil.which(executable) is None:
@@ -958,11 +923,12 @@ def _run_preflight(
         CONFIG["bed_music_key"],
         description="static bed music",
     )
-    _head_required_object(
-        ctx,
-        CONFIG["logo_key"],
-        description="static STC logo",
-    )
+    if include_logo:
+        _head_required_object(
+            ctx,
+            CONFIG["logo_key"],
+            description="static STC logo",
+        )
     for clip in clips:
         _head_required_object(
             ctx,
@@ -977,9 +943,19 @@ def _process_clip(
     clip: AssembleClip,
     clip_srt_content: bytes,
     bed_music: Path,
-    logo: Path,
+    logo: Path | None,
+    library_files: Mapping[str, Path],
+    *,
+    hook_asset: LibraryAsset,
+    outro_asset: LibraryAsset,
 ) -> None:
-    logger.info("assemble[%s]: processing clip=%s", ctx.job.id, clip.clip_id)
+    logger.info(
+        "assemble[%s]: processing clip=%s hook=%s outro=%s",
+        ctx.job.id,
+        clip.clip_id,
+        hook_asset.id,
+        outro_asset.id,
+    )
     with tempfile.TemporaryDirectory(
         prefix=f"{clip.clip_id}-", dir=ctx.workspace.dir
     ) as temp_name:
@@ -994,62 +970,61 @@ def _process_clip(
             main_source,
             description=f"clip {clip.clip_id} main clip download",
         )
-        sources: dict[AssetName, Path] = {}
-        for asset in ASSET_ORDER:
-            source = directory / f"{asset}.mp4"
-            _download_to(
-                ctx,
-                clip.generated_keys[asset],
-                source,
-                description=f"clip {clip.clip_id} asset {asset} download",
-            )
-            sources[asset] = source
 
         # Measure each overlay against its real TTF and shrink the fontsize so
         # the rendered text can never exceed the frame (a None overlay -- empty
         # or absent manifest field -- is logged and skipped inside the helper).
-        overlays: dict[AssetName, TextOverlay | None] = {
-            "hook": _prepare_overlay(
-                directory,
-                job_id=ctx.job.id,
-                clip_id=clip.clip_id,
-                asset="hook",
-                field="hook_text",
-                text=clip.hook_text,
-                base_style=CONFIG["hook_overlay"],
+        hook_overlay = _prepare_overlay(
+            directory,
+            job_id=ctx.job.id,
+            clip_id=clip.clip_id,
+            asset="hook",
+            field="hook_text",
+            text=clip.hook_text,
+            base_style=CONFIG["hook_overlay"],
+        )
+        close_overlay = _prepare_overlay(
+            directory,
+            job_id=ctx.job.id,
+            clip_id=clip.clip_id,
+            asset="outro",
+            field="close_text",
+            text=clip.close_text,
+            base_style=CONFIG["close_overlay"],
+        )
+
+        hook_normalized = directory / "hook_normalized.mp4"
+        _run_ffmpeg(
+            build_library_segment_command(
+                library_files[hook_asset.id],
+                hook_normalized,
+                text=hook_overlay,
             ),
-            "outro": _prepare_overlay(
-                directory,
-                job_id=ctx.job.id,
-                clip_id=clip.clip_id,
-                asset="outro",
-                field="close_text",
-                text=clip.close_text,
-                base_style=CONFIG["close_overlay"],
+            description=f"clip {clip.clip_id} asset hook normalization",
+        )
+
+        # The logo is overlaid ONLY when the catalog says the asset lacks a
+        # baked one; every current library outro is logo_baked, so this is
+        # normally a no-op.
+        outro_logo: Path | None = None
+        if not outro_asset.logo_baked:
+            if logo is None:
+                raise AssembleError(
+                    f"assemble: clip {clip.clip_id} outro asset "
+                    f"{outro_asset.id} needs the logo overlay but the logo "
+                    "was not downloaded"
+                )
+            outro_logo = logo
+        outro_normalized = directory / "outro_normalized.mp4"
+        _run_ffmpeg(
+            build_library_segment_command(
+                library_files[outro_asset.id],
+                outro_normalized,
+                logo=outro_logo,
+                text=close_overlay,
             ),
-            "bridge_in": None,
-            "bridge_out": None,
-        }
-        normalized: dict[AssetName, Path] = {}
-        speeds: dict[AssetName, float] = {
-            "hook": CONFIG["hook_speed"],
-            "outro": CONFIG["outro_speed"],
-            "bridge_in": CONFIG["bridge_speed"],
-            "bridge_out": CONFIG["bridge_speed"],
-        }
-        for asset in ASSET_ORDER:
-            output = directory / f"{asset}_normalized.mp4"
-            _run_ffmpeg(
-                build_generated_segment_command(
-                    sources[asset],
-                    output,
-                    speed=speeds[asset],
-                    logo=logo if asset == "outro" else None,
-                    text=overlays[asset],
-                ),
-                description=f"clip {clip.clip_id} asset {asset} normalization",
-            )
-            normalized[asset] = output
+            description=f"clip {clip.clip_id} asset outro normalization",
+        )
 
         captioned_main = directory / "main_captioned.mp4"
         _run_ffmpeg(
@@ -1070,84 +1045,31 @@ def _process_clip(
             description=f"clip {clip.clip_id} silence removal",
         )
 
-        # bridge_out tail trim: the generated bridge_out's final frames stutter,
-        # so drop its last BRIDGE_OUT_TAIL_TRIM seconds BEFORE the boundary fade,
-        # so the dip-to-black lands on the trimmed endpoint. Guard: if the
-        # segment is shorter than trim + fade, skip it (trimming would leave no
-        # room for the fade, or produce a zero-length clip).
-        bridge_out_processed = normalized["bridge_out"]
-        tail_trim = CONFIG["bridge_out_tail_trim_seconds"]
-        if tail_trim > 0:
-            fade = CONFIG["boundary_fade_seconds"]
-            bridge_out_duration = _probe_duration(
-                normalized["bridge_out"],
-                description=f"clip {clip.clip_id} segment bridge_out (pre-trim)",
-            )
-            if bridge_out_duration < tail_trim + fade:
-                logger.warning(
-                    "assemble[%s]: clip %s bridge_out is %.3fs, shorter than "
-                    "trim (%.3fs) + fade (%.3fs); skipping tail trim",
-                    ctx.job.id,
-                    clip.clip_id,
-                    bridge_out_duration,
-                    tail_trim,
-                    fade,
-                )
-            else:
-                trimmed_bridge_out = directory / "bridge_out_trimmed.mp4"
-                _run_ffmpeg(
-                    build_tail_trim_command(
-                        normalized["bridge_out"],
-                        trimmed_bridge_out,
-                        keep_duration_s=bridge_out_duration - tail_trim,
-                    ),
-                    description=(
-                        f"clip {clip.clip_id} segment bridge_out tail trim"
-                    ),
-                )
-                bridge_out_processed = trimmed_bridge_out
-
-        processed: dict[SegmentName, Path] = {
-            "hook": normalized["hook"],
-            "bridge_in": normalized["bridge_in"],
-            "main": trimmed_main,
-            "bridge_out": bridge_out_processed,
-            "outro": normalized["outro"],
-        }
-        faded: dict[SegmentName, Path] = {}
-        for segment, (fade_in, fade_out) in BOUNDARY_FADE_SIDES.items():
-            faded_output = directory / f"{segment}_faded.mp4"
-            duration_s = _probe_duration(
-                processed[segment],
-                description=f"clip {clip.clip_id} segment {segment}",
-            )
-            _run_ffmpeg(
-                build_boundary_fade_command(
-                    processed[segment],
-                    faded_output,
-                    duration_s=duration_s,
-                    fade_in=fade_in,
-                    fade_out=fade_out,
-                ),
-                description=f"clip {clip.clip_id} segment {segment} "
-                "boundary fades",
-            )
-            faded[segment] = faded_output
+        # Durations for the xfade offsets: probed from the NORMALIZED files,
+        # never taken from catalog duration_s (nominal 4s measures ~4.04s).
+        hook_duration = _probe_duration(
+            hook_normalized, description=f"clip {clip.clip_id} segment hook"
+        )
+        main_duration = _probe_duration(
+            trimmed_main, description=f"clip {clip.clip_id} segment main"
+        )
+        outro_duration = _probe_duration(
+            outro_normalized, description=f"clip {clip.clip_id} segment outro"
+        )
 
         final_path = directory / f"final_{clip.clip_id}_9x16.mp4"
         _run_ffmpeg(
             build_final_command(
-                (
-                    faded["hook"],
-                    faded["bridge_in"],
-                    faded["main"],
-                    faded["bridge_out"],
-                    faded["outro"],
-                ),
+                hook_normalized,
+                trimmed_main,
+                outro_normalized,
                 bed_music,
                 final_path,
+                hook_duration_s=hook_duration,
+                main_duration_s=main_duration,
+                outro_duration_s=outro_duration,
             ),
-            description=f"clip {clip.clip_id} final concat and audio mix",
+            description=f"clip {clip.clip_id} final xfade and audio mix",
         )
 
         output_key = (
@@ -1173,6 +1095,60 @@ def _process_clip(
             clip.clip_id,
             output_key,
         )
+
+
+# --------------------------------------------------------------------------- #
+# Library catalog (S3 load + selection resolution)
+# --------------------------------------------------------------------------- #
+
+
+def _load_catalog(ctx: AssembleStageContext) -> LibraryCatalog:
+    """Load the asset library catalog; the stage cannot run without it."""
+
+    try:
+        return LibraryCatalog.from_s3(
+            ctx.workspace.s3, ctx.workspace.bucket, ctx.config.library_prefix
+        )
+    except Exception as exc:
+        raise AssembleError(
+            f"assemble: asset library catalog unavailable or invalid: {exc}"
+        ) from exc
+
+
+def _resolve_asset(
+    catalog: LibraryCatalog,
+    clip_id: str,
+    asset_id: str,
+    expected_type: str,
+) -> LibraryAsset:
+    asset = catalog.get(asset_id)
+    if asset is None:
+        raise AssembleError(
+            f"assemble: clip {clip_id} asset id {asset_id!r} is not in the "
+            "library catalog"
+        )
+    if asset.type != expected_type:
+        raise AssembleError(
+            f"assemble: clip {clip_id} asset {asset_id!r} has type "
+            f"{asset.type!r}, expected {expected_type!r}"
+        )
+    return asset
+
+
+def _download_library_asset(
+    ctx: AssembleStageContext, asset: LibraryAsset
+) -> Path:
+    return _retry_once(
+        lambda: ctx.workspace.download(
+            asset.s3_key, f"assemble/library/{asset.id}.mp4"
+        ),
+        description=f"library asset {asset.id} download ({asset.s3_key})",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Overlay preparation
+# --------------------------------------------------------------------------- #
 
 
 def _write_overlay_textfile(
@@ -1312,36 +1288,9 @@ def _prepare_overlay(
     return _write_overlay_textfile(directory, field, text, style)
 
 
-def _generated_s3_key(
-    generated: Mapping[str, object],
-    clip_id: str,
-    asset: AssetName,
-) -> str:
-    raw_checkpoint = generated.get(asset)
-    if not isinstance(raw_checkpoint, dict):
-        raise AssembleError(
-            f"assemble: clip {clip_id} missing generated asset {asset}"
-        )
-    checkpoint = cast(dict[str, object], raw_checkpoint)
-    s3_key = checkpoint.get("s3Key")
-    if not isinstance(s3_key, str) or not s3_key:
-        raise AssembleError(
-            f"assemble: clip {clip_id} missing generated asset {asset}.s3Key"
-        )
-    for field in ("generationId", "completedAt"):
-        value = checkpoint.get(field)
-        if not isinstance(value, str) or not value:
-            raise AssembleError(
-                f"assemble: clip {clip_id} generated asset "
-                f"{asset}.{field} must be a non-empty string"
-            )
-    credits = checkpoint.get("estimatedCredits")
-    if isinstance(credits, bool) or not isinstance(credits, int):
-        raise AssembleError(
-            f"assemble: clip {clip_id} generated asset "
-            f"{asset}.estimatedCredits must be an integer"
-        )
-    return s3_key
+# --------------------------------------------------------------------------- #
+# Manifest field helpers
+# --------------------------------------------------------------------------- #
 
 
 def _assembled_checkpoint(
@@ -1412,6 +1361,11 @@ def _required_clip_int(
     return value
 
 
+# --------------------------------------------------------------------------- #
+# S3 and ffmpeg plumbing
+# --------------------------------------------------------------------------- #
+
+
 def _head_required_object(
     ctx: AssembleStageContext,
     s3_key: str,
@@ -1471,34 +1425,19 @@ def _drawtext_filter(text: TextOverlay) -> str:
     )
 
 
-def _silent_audio_source() -> str:
-    return (
-        f"anullsrc=r={CONFIG['audio_sample_rate']}:"
-        f"cl={CONFIG['audio_layout']}"
-    )
-
-
 def _normalized_video_output() -> str:
     return (
         f"format={CONFIG['pixel_format']},"
-        f"setsar={CONFIG['sample_aspect_ratio']}"
+        f"setsar={CONFIG['sample_aspect_ratio']},"
+        "settb=AVTB"
     )
 
 
-def _encoding_args(output: Path, *, shortest: bool) -> list[str]:
-    args = [
-        "-c:v",
-        CONFIG["video_codec"],
-        "-pix_fmt",
-        CONFIG["pixel_format"],
-        "-c:a",
-        CONFIG["audio_codec"],
-        "-movflags",
-        "+faststart",
-    ]
-    if shortest:
-        args.append("-shortest")
-    args.append(str(output))
+def _encoding_args(output: Path, *, audio: bool = True) -> list[str]:
+    args = ["-c:v", CONFIG["video_codec"], "-pix_fmt", CONFIG["pixel_format"]]
+    if audio:
+        args.extend(["-c:a", CONFIG["audio_codec"]])
+    args.extend(["-movflags", "+faststart", str(output)])
     return args
 
 

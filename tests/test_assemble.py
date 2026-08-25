@@ -5,10 +5,10 @@ import logging
 import re
 import shutil
 import subprocess
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from mypy_boto3_s3.client import S3Client
@@ -16,8 +16,8 @@ from psycopg import Connection
 from psycopg.rows import DictRow
 
 from worker import jobs
-from worker.artifacts import main_clip_key
 from worker.jobs import Job
+from worker.library import LibraryCatalog
 from worker.stages import assemble
 from worker.stages.assemble import (
     AssembleError,
@@ -25,11 +25,10 @@ from worker.stages.assemble import (
     CONFIG,
     SilenceInterval,
     TextOverlay,
-    build_boundary_fade_command,
     build_clip_srt,
     build_duration_probe_command,
     build_final_command,
-    build_generated_segment_command,
+    build_library_segment_command,
     build_main_caption_command,
     build_silence_cut_command,
     build_silence_detect_command,
@@ -52,8 +51,58 @@ MASTER_SRT = (
     b"00:00:11,500 --> 00:00:12,500\r\n"
     b"Texto final\r\n"
 )
-PROBED_DURATION_S = 7.5
+# Probed durations of the normalized segment FILES (never catalog nominals):
+# hook 4.04, main 135.2, outro 5.04 -> offsets 3.79 / 138.49, total 143.53.
+HOOK_DUR = 4.04
+MAIN_DUR = 135.2
+OUTRO_DUR = 5.04
+SEGMENT_DURATIONS = {
+    "hook_normalized.mp4": HOOK_DUR,
+    "main_trimmed.mp4": MAIN_DUR,
+    "outro_normalized.mp4": OUTRO_DUR,
+}
+LIBRARY_KEYS = {
+    "H01": "library/hooks/H01.mp4",
+    "H02": "library/hooks/H02.mp4",
+    "O01": "library/outros/O01.mp4",  # logo_baked True
+    "O02": "library/outros/O02.mp4",  # logo_baked False
+}
 TEXTFILE_RE = re.compile(r"textfile='([^']+)'")
+# Any video dip-to-black: fade=t=... NOT preceded by 'a' (the audio end fade
+# afade=t=in must survive; xfade=transition=fade never matches this pattern).
+VIDEO_FADE_RE = re.compile(r"(?<!a)fade=t=")
+
+
+def _test_catalog() -> LibraryCatalog:
+    def asset(
+        asset_id: str, asset_type: str, *, logo_baked: bool = False
+    ) -> dict[str, Any]:
+        return {
+            "id": asset_id,
+            "type": asset_type,
+            "s3_key": LIBRARY_KEYS[asset_id],
+            "duration_s": 4.0 if asset_type == "hook" else 5.0,
+            "category": ["mindset"],
+            "tags": ["psychology"],
+            "character": None,
+            "description": f"{asset_id} test asset",
+            "times_used": 0,
+            "logo_baked": logo_baked,
+        }
+
+    return LibraryCatalog.from_dict(
+        {
+            "version": 1,
+            "updated_at": "2026-08-25T00:00:00Z",
+            "notes": "test notes",
+            "assets": [
+                asset("H01", "hook"),
+                asset("H02", "hook"),
+                asset("O01", "outro", logo_baked=True),
+                asset("O02", "outro", logo_baked=False),
+            ],
+        }
+    )
 
 
 class FakeS3:
@@ -137,30 +186,17 @@ class Harness:
         return matches[0]
 
 
-def _generated_checkpoint(asset: str) -> dict[str, object]:
-    return {
-        "s3Key": f"pipeline/{JOB_ID}/generated/{CLIP_ID}/{asset}.mp4",
-        "generationId": f"generation-{asset}",
-        "completedAt": "hand-written opaque value",
-        "estimatedCredits": 36,
-    }
-
-
-def _manifest(
+def _clip(
+    clip_id: str = CLIP_ID,
     *,
     assembled: bool = False,
-    missing_asset: str | None = None,
     hook_text: str | None = None,
     close_text: str | None = None,
+    hook_asset_id: str = "H01",
+    outro_asset_id: str = "O01",
 ) -> dict[str, object]:
-    assets = ("hook", "outro", "bridge_in", "bridge_out")
-    generated = {
-        asset: _generated_checkpoint(asset)
-        for asset in assets
-        if asset != missing_asset
-    }
     clip: dict[str, object] = {
-        "id": CLIP_ID,
+        "id": clip_id,
         "approved": True,
         "start": "00:00:10,000",
         "end": "00:00:12,500",
@@ -168,7 +204,8 @@ def _manifest(
         "end_block": 2,
         "duration_seconds": 2.5,
         "transcript": "flat text is deliberately unused",
-        "generated": generated,
+        "hook_asset_id": hook_asset_id,
+        "outro_asset_id": outro_asset_id,
     }
     if hook_text is not None:
         clip["hook_text"] = hook_text
@@ -176,17 +213,25 @@ def _manifest(
         clip["close_text"] = close_text
     if assembled:
         clip["assembled"] = {
-            "s3Key": f"pipeline/{JOB_ID}/final/final_{CLIP_ID}_9x16.mp4",
+            "s3Key": f"pipeline/{JOB_ID}/final/final_{clip_id}_9x16.mp4",
             "completedAt": "2026-07-16T12:00:00+00:00",
         }
+    return clip
+
+
+def _manifest_for(clips: list[dict[str, object]]) -> dict[str, object]:
     return {
         "srt_file": MASTER_SRT_KEY,
         "source_video": f"pipeline/{JOB_ID}/session_bleeped.mp4",
         "status": "approved",
-        "clips": [clip],
+        "clips": clips,
         "generated": "2026-07-16",
         "rejected_segments": [],
     }
+
+
+def _manifest(**clip_kwargs: Any) -> dict[str, object]:
+    return _manifest_for([_clip(**clip_kwargs)])
 
 
 def _approved_clip(manifest: Mapping[str, object]) -> dict[str, object]:
@@ -229,18 +274,15 @@ def _harness(
             CONFIG["bed_music_key"]: b"bed",
             CONFIG["logo_key"]: b"logo",
             MASTER_SRT_KEY: MASTER_SRT,
-            MAIN_CLIP_KEY: b"main",
         }
     )
-    clip = _approved_clip(manifest)
-    generated = clip.get("generated")
-    if isinstance(generated, dict):
-        for raw_checkpoint in generated.values():
-            if not isinstance(raw_checkpoint, dict):
-                continue
-            key = raw_checkpoint.get("s3Key")
-            if isinstance(key, str):
-                fake_s3.objects[key] = b"generated"
+    for key in LIBRARY_KEYS.values():
+        fake_s3.objects[key] = b"library"
+    raw_clips = manifest["clips"]
+    assert isinstance(raw_clips, list)
+    for raw_clip in raw_clips:
+        assert isinstance(raw_clip, dict)
+        fake_s3.objects[f"pipeline/{JOB_ID}/clips/{raw_clip['id']}.mp4"] = b"main"
 
     workspace = Workspace(
         JOB_ID,
@@ -271,6 +313,7 @@ def _harness(
     monkeypatch.setattr(jobs, "save_manifest_checkpoint", fake_db.save)
     monkeypatch.setattr(shutil, "which", lambda executable: "/usr/bin/ffmpeg")
     monkeypatch.setattr(subprocess, "run", _successful_probe)
+    monkeypatch.setattr(assemble, "_load_catalog", lambda ctx: _test_catalog())
 
     ffmpeg_commands: list[list[str]] = []
     ffmpeg_descriptions: list[str] = []
@@ -291,7 +334,7 @@ def _harness(
 
     def fake_probe_duration(source: Path, *, description: str) -> float:
         probed_segments.append(source.name)
-        return PROBED_DURATION_S
+        return SEGMENT_DURATIONS[source.name]
 
     monkeypatch.setattr(assemble, "_run_ffmpeg", fake_ffmpeg)
     monkeypatch.setattr(assemble, "_probe_duration", fake_probe_duration)
@@ -305,6 +348,11 @@ def _harness(
         probed_segments=probed_segments,
         overlay_textfile_bytes=overlay_textfile_bytes,
     )
+
+
+# --------------------------------------------------------------------------- #
+# SRT slicing
+# --------------------------------------------------------------------------- #
 
 
 def test_master_srt_slice_preserves_text_and_retimes_blocks() -> None:
@@ -356,6 +404,11 @@ def test_master_srt_slice_rejects_missing_block() -> None:
             clip_start_ms=10_000,
             clip_id=CLIP_ID,
         )
+
+
+# --------------------------------------------------------------------------- #
+# Preflight, catalog resolution, and validation
+# --------------------------------------------------------------------------- #
 
 
 def test_preflight_rejects_missing_ffmpeg(
@@ -443,11 +496,13 @@ def test_preflight_names_missing_bed_music(
     assert harness.db.checkpoints == []
 
 
-def test_preflight_names_missing_logo(
+def test_preflight_names_missing_logo_only_when_needed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    harness = _harness(monkeypatch, tmp_path, _manifest())
+    # O02 is the only library outro without a baked logo -> the logo becomes a
+    # hard requirement again.
+    harness = _harness(monkeypatch, tmp_path, _manifest(outro_asset_id="O02"))
     del harness.s3.objects[CONFIG["logo_key"]]
 
     with pytest.raises(AssembleError, match=CONFIG["logo_key"]):
@@ -456,24 +511,39 @@ def test_preflight_names_missing_logo(
     assert harness.db.checkpoints == []
 
 
-def test_preflight_names_missing_generated_asset(
+def test_logo_skipped_when_outro_logo_baked(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    harness = _harness(
-        monkeypatch,
-        tmp_path,
-        _manifest(missing_asset="bridge_out"),
-    )
+    # O01 has logo_baked=True: the logo object may not even exist and the run
+    # must neither HEAD nor download it, and the outro gets no overlay input.
+    harness = _harness(monkeypatch, tmp_path, _manifest())
+    del harness.s3.objects[CONFIG["logo_key"]]
 
-    with pytest.raises(
-        AssembleError,
-        match=f"clip {CLIP_ID} missing generated asset bridge_out",
-    ):
-        harness.run()
+    harness.run()
 
-    assert harness.s3.heads == []
-    assert harness.db.checkpoints == []
+    assert CONFIG["logo_key"] not in harness.s3.heads
+    assert CONFIG["logo_key"] not in harness.s3.downloads
+    outro_command = harness.command_for("asset outro normalization")
+    assert outro_command.count("-i") == 1
+    outro_filter = outro_command[outro_command.index("-filter_complex") + 1]
+    assert "overlay=" not in outro_filter
+
+
+def test_logo_overlaid_when_outro_not_logo_baked(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = _harness(monkeypatch, tmp_path, _manifest(outro_asset_id="O02"))
+
+    harness.run()
+
+    assert CONFIG["logo_key"] in harness.s3.heads
+    assert CONFIG["logo_key"] in harness.s3.downloads
+    outro_command = harness.command_for("asset outro normalization")
+    assert outro_command.count("-i") == 2
+    outro_filter = outro_command[outro_command.index("-filter_complex") + 1]
+    assert "[base][logo]overlay=(W-w)/2:120:eof_action=repeat" in outro_filter
 
 
 def test_preflight_names_missing_main_clip(
@@ -489,6 +559,77 @@ def test_preflight_names_missing_main_clip(
     assert harness.db.checkpoints == []
 
 
+def test_unknown_asset_id_fails_before_any_work(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = _harness(monkeypatch, tmp_path, _manifest(hook_asset_id="H99"))
+
+    with pytest.raises(
+        AssembleError,
+        match="asset id 'H99' is not in the library catalog",
+    ):
+        harness.run()
+
+    # Resolution happens before preflight/downloads: nothing was touched.
+    assert harness.s3.heads == []
+    assert harness.s3.downloads == []
+    assert harness.ffmpeg_commands == []
+    assert harness.db.checkpoints == []
+
+
+def test_wrong_type_asset_id_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = _harness(monkeypatch, tmp_path, _manifest(hook_asset_id="O01"))
+
+    with pytest.raises(
+        AssembleError, match="has type 'outro', expected 'hook'"
+    ):
+        harness.run()
+
+    assert harness.ffmpeg_commands == []
+
+
+def test_manifest_requires_selection_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest()
+    del _approved_clip(manifest)["hook_asset_id"]
+    harness = _harness(monkeypatch, tmp_path, manifest)
+
+    with pytest.raises(
+        AssembleError,
+        match=r"clips\[0\].hook_asset_id must be a non-empty string",
+    ):
+        harness.run()
+
+    assert harness.db.checkpoints == []
+
+
+def test_manifest_rejects_non_string_overlay_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest()
+    _approved_clip(manifest)["hook_text"] = 123
+    harness = _harness(monkeypatch, tmp_path, manifest)
+
+    with pytest.raises(
+        AssembleError, match=r"clips\[0\].hook_text must be a string"
+    ):
+        harness.run()
+
+    assert harness.db.checkpoints == []
+
+
+# --------------------------------------------------------------------------- #
+# run_assemble end-to-end (mocked ffmpeg/probe)
+# --------------------------------------------------------------------------- #
+
+
 def test_resume_skips_assembled_clip(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -502,6 +643,8 @@ def test_resume_skips_assembled_clip(
     assert harness.db.checkpoints == []
     assert harness.heartbeats == []
     assert harness.s3.uploads == [f"pipeline/{JOB_ID}/manifest.json"]
+    # No library asset is fetched for a clip that is already assembled.
+    assert not set(LIBRARY_KEYS.values()) & set(harness.s3.downloads)
     assert not harness.context.workspace.dir.exists()
 
 
@@ -525,27 +668,25 @@ def test_success_uploads_and_checkpoints_once_per_clip(
     assert checkpoint["s3Key"] == final_key
     assert isinstance(checkpoint["completedAt"], str)
     assert harness.heartbeats == [1]
-    assert len(harness.ffmpeg_commands) == 14
+    assert len(harness.ffmpeg_commands) == 6
     assert harness.ffmpeg_descriptions == [
         f"clip {CLIP_ID} asset hook normalization",
         f"clip {CLIP_ID} asset outro normalization",
-        f"clip {CLIP_ID} asset bridge_in normalization",
-        f"clip {CLIP_ID} asset bridge_out normalization",
         f"clip {CLIP_ID} main caption burn",
         f"clip {CLIP_ID} silence detection",
         f"clip {CLIP_ID} silence removal",
-        f"clip {CLIP_ID} segment bridge_out tail trim",
-        f"clip {CLIP_ID} segment hook boundary fades",
-        f"clip {CLIP_ID} segment bridge_in boundary fades",
-        f"clip {CLIP_ID} segment main boundary fades",
-        f"clip {CLIP_ID} segment bridge_out boundary fades",
-        f"clip {CLIP_ID} segment outro boundary fades",
-        f"clip {CLIP_ID} final concat and audio mix",
+        f"clip {CLIP_ID} final xfade and audio mix",
+    ]
+    # Durations for offsets come from the normalized files, in order.
+    assert harness.probed_segments == [
+        "hook_normalized.mp4",
+        "main_trimmed.mp4",
+        "outro_normalized.mp4",
     ]
     assert not harness.context.workspace.dir.exists()
 
 
-def test_boundary_fades_probe_processed_intermediates(
+def test_final_command_xfade_math_from_probed_durations(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -553,46 +694,101 @@ def test_boundary_fades_probe_processed_intermediates(
 
     harness.run()
 
-    # Durations come from the processed intermediates, post speed change and
-    # post silence removal, never from arithmetic on the sources. The first
-    # probe is the bridge_out tail-trim precheck; the boundary-fade loop then
-    # probes each segment it fades (bridge_out post-trim).
-    assert harness.probed_segments == [
-        "bridge_out_normalized.mp4",
-        "hook_normalized.mp4",
-        "bridge_in_normalized.mp4",
-        "main_trimmed.mp4",
-        "bridge_out_trimmed.mp4",
-        "outro_normalized.mp4",
-    ]
-
-    fade_in = "fade=t=in:st=0:d=0.25"
-    fade_out = f"fade=t=out:st={PROBED_DURATION_S - 0.25:.6f}:d=0.25"
-    expected_filters = {
-        "hook": f"{fade_out},format=yuv420p,setsar=1",
-        "bridge_in": f"{fade_in},{fade_out},format=yuv420p,setsar=1",
-        "main": f"{fade_in},{fade_out},format=yuv420p,setsar=1",
-        "bridge_out": f"{fade_in},{fade_out},format=yuv420p,setsar=1",
-        "outro": f"{fade_in},format=yuv420p,setsar=1",
-    }
-    for segment, expected_filter in expected_filters.items():
-        command = harness.command_for(f"segment {segment} boundary fades")
-        assert command[command.index("-vf") + 1] == expected_filter
-        assert command[command.index("-c:a") + 1] == "copy"
-
-    concat_command = harness.command_for("final concat and audio mix")
+    final = harness.command_for("final xfade and audio mix")
+    graph = final[final.index("-filter_complex") + 1]
+    # offset1 = 4.04 - 0.25; offset2 = 4.04 + 135.2 - 0.75
+    assert (
+        "[v0][v1]xfade=transition=fade:duration=0.25:offset=3.790000[vx]"
+        in graph
+    )
+    assert (
+        "[vx][v2]xfade=transition=fade:duration=0.5:offset=138.490000[video]"
+        in graph
+    )
+    # Voice starts at the hook->main crossfade: (4.04 - 0.25) * 1000 ms.
+    assert "[1:a]adelay=3790|3790,apad[voice]" in graph
+    # Bed and end fade are unchanged from the concat era.
+    assert "volume=0.02[bed]" in graph
+    assert "areverse,afade=t=in:d=1.5,areverse" in graph
+    # -t clamps to hook + main + outro - 0.75.
+    assert final[final.index("-t") + 1] == "143.530000"
     inputs = [
-        Path(concat_command[index + 1]).name
-        for index, argument in enumerate(concat_command)
+        Path(final[index + 1]).name
+        for index, argument in enumerate(final)
         if argument == "-i"
     ]
     assert inputs == [
-        "hook_faded.mp4",
-        "bridge_in_faded.mp4",
-        "main_faded.mp4",
-        "bridge_out_faded.mp4",
-        "outro_faded.mp4",
+        "hook_normalized.mp4",
+        "main_trimmed.mp4",
+        "outro_normalized.mp4",
         "bed_music.mp3",
+    ]
+
+
+def test_settb_on_every_xfade_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = _harness(monkeypatch, tmp_path, _manifest())
+
+    harness.run()
+
+    # In the final graph, each xfade input is timebase-normalized explicitly.
+    final = harness.command_for("final xfade and audio mix")
+    graph = final[final.index("-filter_complex") + 1]
+    for chain in ("[0:v]settb=AVTB[v0]", "[1:v]settb=AVTB[v1]", "[2:v]settb=AVTB[v2]"):
+        assert chain in graph
+
+    # And every segment-producing pass already normalizes its output timebase.
+    for suffix in (
+        "asset hook normalization",
+        "asset outro normalization",
+        "main caption burn",
+        "silence removal",
+    ):
+        command = harness.command_for(suffix)
+        filter_string = command[command.index("-filter_complex") + 1]
+        assert "setsar=1,settb=AVTB[v]" in filter_string
+
+
+def test_no_video_fades_anywhere(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = _harness(monkeypatch, tmp_path, _manifest())
+
+    harness.run()
+
+    for command in harness.ffmpeg_commands:
+        for argument in command:
+            assert not VIDEO_FADE_RE.search(argument), argument
+    # Sanity: the joins really are crossfades.
+    final = harness.command_for("final xfade and audio mix")
+    graph = final[final.index("-filter_complex") + 1]
+    assert graph.count("xfade=transition=fade") == 2
+
+
+def test_library_assets_download_once_per_job(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Two clips selecting the SAME hook and outro: each library asset is
+    # downloaded exactly once for the whole job.
+    manifest = _manifest_for([_clip("clip_04"), _clip("clip_05")])
+    harness = _harness(monkeypatch, tmp_path, manifest)
+
+    harness.run()
+
+    assert harness.s3.downloads.count(LIBRARY_KEYS["H01"]) == 1
+    assert harness.s3.downloads.count(LIBRARY_KEYS["O01"]) == 1
+    assert f"pipeline/{JOB_ID}/clips/clip_04.mp4" in harness.s3.downloads
+    assert f"pipeline/{JOB_ID}/clips/clip_05.mp4" in harness.s3.downloads
+    assert len(harness.ffmpeg_commands) == 12
+    assert len(harness.db.checkpoints) == 2
+    assert harness.s3.uploads == [
+        f"pipeline/{JOB_ID}/final/final_clip_04_9x16.mp4",
+        f"pipeline/{JOB_ID}/final/final_clip_05_9x16.mp4",
+        f"pipeline/{JOB_ID}/manifest.json",
     ]
 
 
@@ -618,18 +814,14 @@ def test_success_burns_overlays_only_where_text_exists(
 
     outro_command = harness.command_for("asset outro normalization")
     outro_filter = outro_command[outro_command.index("-filter_complex") + 1]
-    assert "eof_action=repeat,drawtext=" in outro_filter
+    assert "drawtext=" in outro_filter
     assert "enable='gte(t\\,2.5)'" in outro_filter
 
     for description in (
-        "asset bridge_in normalization",
-        "asset bridge_out normalization",
         "main caption burn",
         "silence detection",
         "silence removal",
-        "segment hook boundary fades",
-        "segment outro boundary fades",
-        "final concat and audio mix",
+        "final xfade and audio mix",
     ):
         command = harness.command_for(description)
         assert not any("drawtext" in argument for argument in command)
@@ -677,114 +869,75 @@ def test_success_with_empty_overlay_fields_produces_no_drawtext(
     assert harness.overlay_textfile_bytes == {}
 
 
-def test_manifest_rejects_non_string_overlay_text(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    manifest = _manifest()
-    _approved_clip(manifest)["hook_text"] = 123
-    harness = _harness(monkeypatch, tmp_path, manifest)
-
-    with pytest.raises(
-        AssembleError, match=r"clips\[0\].hook_text must be a string"
-    ):
-        harness.run()
-
-    assert harness.db.checkpoints == []
+# --------------------------------------------------------------------------- #
+# Command builders (pure argv tests)
+# --------------------------------------------------------------------------- #
 
 
-def test_generated_segment_command_argv(tmp_path: Path) -> None:
-    source = tmp_path / "hook.mp4"
+def test_library_segment_command_argv(tmp_path: Path) -> None:
+    source = tmp_path / "H01.mp4"
     output = tmp_path / "hook_normalized.mp4"
 
-    assert build_generated_segment_command(
-        source,
-        output,
-        speed=CONFIG["hook_speed"],
-    ) == [
+    assert build_library_segment_command(source, output) == [
         "ffmpeg",
         "-y",
         "-i",
         str(source),
-        "-f",
-        "lavfi",
-        "-i",
-        "anullsrc=r=48000:cl=stereo",
         "-filter_complex",
         "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
-        "setpts=PTS/1.5,fps=30,format=yuv420p,setsar=1[v]",
+        "fps=30,format=yuv420p,setsar=1,settb=AVTB[v]",
         "-map",
         "[v]",
-        "-map",
-        "1:a",
         "-c:v",
         "libx264",
         "-pix_fmt",
         "yuv420p",
-        "-c:a",
-        "aac",
         "-movflags",
         "+faststart",
-        "-shortest",
         str(output),
     ]
 
 
-def test_outro_segment_command_overlays_logo_argv(tmp_path: Path) -> None:
-    source = tmp_path / "outro.mp4"
+def test_library_segment_command_with_logo_argv(tmp_path: Path) -> None:
+    source = tmp_path / "O02.mp4"
     logo = tmp_path / "logo.png"
     output = tmp_path / "outro_normalized.mp4"
 
-    assert build_generated_segment_command(
-        source,
-        output,
-        speed=CONFIG["outro_speed"],
-        logo=logo,
-    ) == [
+    assert build_library_segment_command(source, output, logo=logo) == [
         "ffmpeg",
         "-y",
         "-i",
         str(source),
         "-i",
         str(logo),
-        "-f",
-        "lavfi",
-        "-i",
-        "anullsrc=r=48000:cl=stereo",
         "-filter_complex",
         "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
-        "setpts=PTS/1.5,fps=30[base];"
+        "fps=30[base];"
         "[1:v]scale=378:-1[logo];"
         "[base][logo]overlay=(W-w)/2:120:eof_action=repeat,"
-        "format=yuv420p,setsar=1[v]",
+        "format=yuv420p,setsar=1,settb=AVTB[v]",
         "-map",
         "[v]",
-        "-map",
-        "2:a",
         "-c:v",
         "libx264",
         "-pix_fmt",
         "yuv420p",
-        "-c:a",
-        "aac",
         "-movflags",
         "+faststart",
-        "-shortest",
         str(output),
     ]
 
 
-def test_generated_segment_command_burns_hook_text_argv(tmp_path: Path) -> None:
-    source = tmp_path / "hook.mp4"
+def test_library_segment_command_burns_hook_text_argv(tmp_path: Path) -> None:
+    source = tmp_path / "H01.mp4"
     output = tmp_path / "hook_normalized.mp4"
     textfile = tmp_path / "hook_text.txt"
 
-    command = build_generated_segment_command(
+    command = build_library_segment_command(
         source,
         output,
-        speed=CONFIG["hook_speed"],
         text=TextOverlay(textfile=textfile, style=CONFIG["hook_overlay"]),
     )
 
@@ -792,7 +945,7 @@ def test_generated_segment_command_burns_hook_text_argv(tmp_path: Path) -> None:
     assert command[filter_index] == (
         "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
-        "setpts=PTS/1.5,fps=30,"
+        "fps=30,"
         f"drawtext=fontfile='{CONFIG['hook_overlay']['fontfile']}':"
         f"textfile='{textfile}':"
         "expansion=none:"
@@ -801,39 +954,27 @@ def test_generated_segment_command_burns_hook_text_argv(tmp_path: Path) -> None:
         "y='h*0.72+30*(1-min(1\\,(t-0.5)/0.4))':"
         "alpha='min(1\\,max(0\\,(t-0.5)/0.4))':"
         "enable='gte(t\\,0.5)',"
-        "format=yuv420p,setsar=1[v]"
+        "format=yuv420p,setsar=1,settb=AVTB[v]"
     )
-    # expansion=none renders the textfile bytes literally (a bare '%' otherwise
-    # blanks the frame under drawtext's default expansion=normal).
-    assert "expansion=none" in command[filter_index]
-    # Appearance animation: fade-in plus a rise from rise_px below the resting
-    # line over anim_duration_s.
-    style = CONFIG["hook_overlay"]
-    assert "alpha=" in command[filter_index]
-    assert (
-        f"{style['rise_px']}*(1-min(1\\,(t-0.5)/{style['anim_duration_s']}))"
-        in command[filter_index]
-    )
-    # Everything around the filter graph is byte-identical to the v1 command.
-    v1_command = build_generated_segment_command(
-        source, output, speed=CONFIG["hook_speed"]
-    )
-    assert command[:filter_index] == v1_command[:filter_index]
-    assert command[filter_index + 1 :] == v1_command[filter_index + 1 :]
+    # No speed step: library assets are authored at final pacing.
+    assert "setpts=PTS/" not in command[filter_index]
+    # Everything around the filter graph is byte-identical to the plain command.
+    plain = build_library_segment_command(source, output)
+    assert command[:filter_index] == plain[:filter_index]
+    assert command[filter_index + 1 :] == plain[filter_index + 1 :]
 
 
-def test_outro_segment_command_burns_close_text_above_logo_argv(
+def test_library_segment_command_burns_close_text_above_logo_argv(
     tmp_path: Path,
 ) -> None:
-    source = tmp_path / "outro.mp4"
+    source = tmp_path / "O02.mp4"
     logo = tmp_path / "logo.png"
     output = tmp_path / "outro_normalized.mp4"
     textfile = tmp_path / "close_text.txt"
 
-    command = build_generated_segment_command(
+    command = build_library_segment_command(
         source,
         output,
-        speed=CONFIG["outro_speed"],
         logo=logo,
         text=TextOverlay(textfile=textfile, style=CONFIG["close_overlay"]),
     )
@@ -842,7 +983,7 @@ def test_outro_segment_command_burns_close_text_above_logo_argv(
     assert command[filter_index] == (
         "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
-        "setpts=PTS/1.5,fps=30[base];"
+        "fps=30[base];"
         "[1:v]scale=378:-1[logo];"
         "[base][logo]overlay=(W-w)/2:120:eof_action=repeat,"
         f"drawtext=fontfile='{CONFIG['close_overlay']['fontfile']}':"
@@ -853,16 +994,9 @@ def test_outro_segment_command_burns_close_text_above_logo_argv(
         "y='h*0.72+30*(1-min(1\\,(t-2.5)/0.4))':"
         "alpha='min(1\\,max(0\\,(t-2.5)/0.4))':"
         "enable='gte(t\\,2.5)',"
-        "format=yuv420p,setsar=1[v]"
+        "format=yuv420p,setsar=1,settb=AVTB[v]"
     )
-    # Shared builder -> the close path carries expansion=none too.
     assert "expansion=none" in command[filter_index]
-    style = CONFIG["close_overlay"]
-    assert "alpha=" in command[filter_index]
-    assert (
-        f"{style['rise_px']}*(1-min(1\\,(t-2.5)/{style['anim_duration_s']}))"
-        in command[filter_index]
-    )
 
 
 def test_overlay_textfile_preserves_manifest_bytes(tmp_path: Path) -> None:
@@ -900,10 +1034,9 @@ def test_hook_text_with_percent_renders_literally(tmp_path: Path) -> None:
     assert overlay.textfile.read_bytes() == text.encode("utf-8")
     assert overlay.textfile.read_bytes() == b"PUEDES PERDER 80%"
 
-    command = build_generated_segment_command(
-        tmp_path / "hook.mp4",
+    command = build_library_segment_command(
+        tmp_path / "H01.mp4",
         tmp_path / "hook_normalized.mp4",
-        speed=CONFIG["hook_speed"],
         text=overlay,
     )
     filter_string = command[command.index("-filter_complex") + 1]
@@ -979,50 +1112,6 @@ def test_pathological_overlay_floors_at_min_fontsize(
     )
 
 
-def test_boundary_fade_command_argv(tmp_path: Path) -> None:
-    source = tmp_path / "segment.mp4"
-    output = tmp_path / "segment_faded.mp4"
-
-    assert build_boundary_fade_command(
-        source,
-        output,
-        duration_s=12.5,
-        fade_in=True,
-        fade_out=True,
-    ) == [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(source),
-        "-vf",
-        "fade=t=in:st=0:d=0.25,"
-        "fade=t=out:st=12.250000:d=0.25,"
-        "format=yuv420p,setsar=1",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "copy",
-        "-movflags",
-        "+faststart",
-        str(output),
-    ]
-
-    hook_command = build_boundary_fade_command(
-        source, output, duration_s=12.5, fade_in=False, fade_out=True
-    )
-    assert hook_command[hook_command.index("-vf") + 1] == (
-        "fade=t=out:st=12.250000:d=0.25,format=yuv420p,setsar=1"
-    )
-    outro_command = build_boundary_fade_command(
-        source, output, duration_s=12.5, fade_in=True, fade_out=False
-    )
-    assert outro_command[outro_command.index("-vf") + 1] == (
-        "fade=t=in:st=0:d=0.25,format=yuv420p,setsar=1"
-    )
-
-
 def test_duration_probe_command_argv(tmp_path: Path) -> None:
     source = tmp_path / "segment.mp4"
 
@@ -1056,7 +1145,7 @@ def test_main_caption_command_argv(tmp_path: Path) -> None:
         "PrimaryColour=&H00FFFFFF,"
         "OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,"
         "Alignment=2,MarginV=50',setpts=PTS/1.0,fps=30,"
-        "format=yuv420p,setsar=1[v];"
+        "format=yuv420p,setsar=1,settb=AVTB[v];"
         "[0:a]aformat=sample_rates=48000:channel_layouts=stereo,"
         "volume=0.68[a]"
     )
@@ -1164,7 +1253,7 @@ def test_silence_commands_argv(tmp_path: Path) -> None:
         str(source),
         "-filter_complex",
         "[0:v]select='not(between(t\\,1.150000\\,2.850000))',"
-        "setpts=N/(30*TB),format=yuv420p,setsar=1[v];"
+        "setpts=N/(30*TB),format=yuv420p,setsar=1,settb=AVTB[v];"
         "[0:a]aselect='not(between(t\\,1.150000\\,2.850000))',"
         "asetpts=N/SR/TB[a]",
         "-map",
@@ -1183,103 +1272,98 @@ def test_silence_commands_argv(tmp_path: Path) -> None:
     ]
 
 
-def test_all_five_concat_segments_are_normalized_to_square_pixels(
-    tmp_path: Path,
-) -> None:
+def test_all_three_segments_are_normalized_for_xfade(tmp_path: Path) -> None:
     logo = tmp_path / "logo.png"
-    generated_commands = [
-        build_generated_segment_command(
-            tmp_path / "hook.mp4",
+    commands = [
+        build_library_segment_command(
+            tmp_path / "H01.mp4",
             tmp_path / "hook_normalized.mp4",
-            speed=CONFIG["hook_speed"],
         ),
-        build_generated_segment_command(
-            tmp_path / "bridge_in.mp4",
-            tmp_path / "bridge_in_normalized.mp4",
-            speed=CONFIG["bridge_speed"],
-        ),
-        build_generated_segment_command(
-            tmp_path / "bridge_out.mp4",
-            tmp_path / "bridge_out_normalized.mp4",
-            speed=CONFIG["bridge_speed"],
-        ),
-        build_generated_segment_command(
-            tmp_path / "outro.mp4",
+        build_library_segment_command(
+            tmp_path / "O02.mp4",
             tmp_path / "outro_normalized.mp4",
-            speed=CONFIG["outro_speed"],
             logo=logo,
         ),
+        build_main_caption_command(
+            tmp_path / "main.mp4",
+            tmp_path / "clip.srt",
+            tmp_path / "main_captioned.mp4",
+        ),
+        build_silence_cut_command(
+            tmp_path / "main_captioned.mp4",
+            tmp_path / "main_trimmed.mp4",
+            (),
+        ),
     ]
-    main_caption_command = build_main_caption_command(
-        tmp_path / "main.mp4",
-        tmp_path / "clip.srt",
-        tmp_path / "main_captioned.mp4",
-    )
-    main_trim_command = build_silence_cut_command(
-        tmp_path / "main_captioned.mp4",
-        tmp_path / "main_trimmed.mp4",
-        (),
-    )
 
-    for command in (*generated_commands, main_caption_command, main_trim_command):
+    for command in commands:
         filter_index = command.index("-filter_complex") + 1
         assert "setsar=1" in command[filter_index]
+        assert "settb=AVTB" in command[filter_index]
 
 
-def test_final_concat_and_bed_mix_command_argv(tmp_path: Path) -> None:
-    segments = tuple(tmp_path / f"segment-{index}.mp4" for index in range(5))
+def test_final_command_argv(tmp_path: Path) -> None:
+    hook = tmp_path / "hook_normalized.mp4"
+    main = tmp_path / "main_trimmed.mp4"
+    outro = tmp_path / "outro_normalized.mp4"
     bed = tmp_path / "bed.mp3"
     output = tmp_path / "final.mp4"
 
     expected_filter = (
-        "[0:v]setpts=PTS-STARTPTS[v0];"
-        "[0:a]asetpts=PTS-STARTPTS[a0];"
-        "[1:v]setpts=PTS-STARTPTS[v1];"
-        "[1:a]asetpts=PTS-STARTPTS[a1];"
-        "[2:v]setpts=PTS-STARTPTS[v2];"
-        "[2:a]asetpts=PTS-STARTPTS[a2];"
-        "[3:v]setpts=PTS-STARTPTS[v3];"
-        "[3:a]asetpts=PTS-STARTPTS[a3];"
-        "[4:v]setpts=PTS-STARTPTS[v4];"
-        "[4:a]asetpts=PTS-STARTPTS[a4];"
-        "[v0][a0][v1][a1][v2][a2][v3][a3][v4][a4]"
-        "concat=n=5:v=1:a=1[video][voice];"
-        "[5:a]aformat=sample_rates=48000:channel_layouts=stereo,"
+        "[0:v]settb=AVTB[v0];"
+        "[1:v]settb=AVTB[v1];"
+        "[2:v]settb=AVTB[v2];"
+        "[v0][v1]xfade=transition=fade:duration=0.25:offset=3.790000[vx];"
+        "[vx][v2]xfade=transition=fade:duration=0.5:offset=138.490000[video];"
+        "[1:a]adelay=3790|3790,apad[voice];"
+        "[3:a]aformat=sample_rates=48000:channel_layouts=stereo,"
         "volume=0.02[bed];"
         "[voice][bed]amix=inputs=2:duration=first:normalize=0:"
         "dropout_transition=0,areverse,afade=t=in:d=1.5,"
         "areverse,asetpts=N/SR/TB[audio]"
     )
-    expected = ["ffmpeg", "-y"]
-    for segment in segments:
-        expected.extend(["-i", str(segment)])
-    expected.extend(
-        [
-            "-stream_loop",
-            "-1",
-            "-i",
-            str(bed),
-            "-filter_complex",
-            expected_filter,
-            "-map",
-            "[video]",
-            "-map",
-            "[audio]",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-r",
-            "30",
-            "-c:a",
-            "aac",
-            "-movflags",
-            "+faststart",
-            str(output),
-        ]
-    )
-
-    assert build_final_command(segments, bed, output) == expected
+    assert build_final_command(
+        hook,
+        main,
+        outro,
+        bed,
+        output,
+        hook_duration_s=HOOK_DUR,
+        main_duration_s=MAIN_DUR,
+        outro_duration_s=OUTRO_DUR,
+    ) == [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(hook),
+        "-i",
+        str(main),
+        "-i",
+        str(outro),
+        "-stream_loop",
+        "-1",
+        "-i",
+        str(bed),
+        "-filter_complex",
+        expected_filter,
+        "-map",
+        "[video]",
+        "-map",
+        "[audio]",
+        "-t",
+        "143.530000",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-r",
+        "30",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        str(output),
+    ]
 
 
 def test_ffmpeg_failure_preserves_stderr_tail_without_retry(
