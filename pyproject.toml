@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
   "anthropic>=0.40",
   "boto3>=1.34",
+  "fonttools>=4.50",
   "psycopg[binary]>=3.1",
   "python-dotenv>=1.0",
   "yt-dlp==2026.7.4",
@@ -41,6 +42,12 @@ warn_unused_ignores = true
 no_implicit_reexport = true
 show_error_codes = true
 files = ["worker", "tests"]
+
+[[tool.mypy.overrides]]
+# fontTools ships no py.typed marker, so strict mode can't resolve its types.
+# We touch only a tiny, stable surface (ttLib TTFont advance widths).
+module = ["fontTools.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 addopts = "-ra"

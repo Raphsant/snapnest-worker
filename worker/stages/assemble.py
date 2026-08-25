@@ -56,6 +56,17 @@ BOUNDARY_FADE_SIDES: dict[SegmentName, tuple[bool, bool]] = {
 }
 T = TypeVar("T")
 
+# Overlay text must never exceed the frame. The rendered width (glyph advance
+# sum + 2*borderw, since drawtext's border sits OUTSIDE text_w) is held within
+# 90% of the output width -- a 5% safe margin per side. When the base fontsize
+# overflows, the assembler shrinks to the largest integer size that fits,
+# floored at OVERLAY_MIN_FONTSIZE; below the floor it logs and proceeds rather
+# than clip silently.
+OVERLAY_FRAME_MARGIN = 0.05
+OVERLAY_MIN_FONTSIZE = 40
+# unitsPerEm + {codepoint: advanceWidth} per TTF path, loaded once (fontTools).
+_FONT_METRICS_CACHE: dict[str, tuple[int, dict[int, int]]] = {}
+
 
 class OverlayStyle(TypedDict):
     """Deterministic drawtext styling for one on-screen text overlay."""
@@ -988,29 +999,31 @@ def _process_clip(
             )
             sources[asset] = source
 
+        # Measure each overlay against its real TTF and shrink the fontsize so
+        # the rendered text can never exceed the frame (a None overlay -- empty
+        # or absent manifest field -- is logged and skipped inside the helper).
         overlays: dict[AssetName, TextOverlay | None] = {
-            "hook": _write_overlay_textfile(
-                directory, "hook_text", clip.hook_text, CONFIG["hook_overlay"]
+            "hook": _prepare_overlay(
+                directory,
+                job_id=ctx.job.id,
+                clip_id=clip.clip_id,
+                asset="hook",
+                field="hook_text",
+                text=clip.hook_text,
+                base_style=CONFIG["hook_overlay"],
             ),
-            "outro": _write_overlay_textfile(
-                directory, "close_text", clip.close_text, CONFIG["close_overlay"]
+            "outro": _prepare_overlay(
+                directory,
+                job_id=ctx.job.id,
+                clip_id=clip.clip_id,
+                asset="outro",
+                field="close_text",
+                text=clip.close_text,
+                base_style=CONFIG["close_overlay"],
             ),
             "bridge_in": None,
             "bridge_out": None,
         }
-        # A None overlay means the manifest field was empty/absent, so this
-        # segment gets no drawtext. Log it -- a silent drop here masqueraded as
-        # a rendering bug and cost a full day to trace.
-        overlay_assets: tuple[AssetName, ...] = ("hook", "outro")
-        for overlay_asset in overlay_assets:
-            if overlays[overlay_asset] is None:
-                logger.info(
-                    "assemble[%s]: clip=%s asset=%s no overlay text; "
-                    "skipping drawtext",
-                    ctx.job.id,
-                    clip.clip_id,
-                    overlay_asset,
-                )
         normalized: dict[AssetName, Path] = {}
         speeds: dict[AssetName, float] = {
             "hook": CONFIG["hook_speed"],
@@ -1169,6 +1182,128 @@ def _write_overlay_textfile(
     textfile = directory / f"{name}.txt"
     textfile.write_bytes(text.encode("utf-8"))
     return TextOverlay(textfile=textfile, style=style)
+
+
+def _overlay_budget_px() -> float:
+    """Usable overlay width: the output frame minus a 5% safe margin each side."""
+
+    return CONFIG["output_width"] * (1 - 2 * OVERLAY_FRAME_MARGIN)
+
+
+def _font_metrics(fontfile: str) -> tuple[int, dict[int, int]]:
+    """Return (unitsPerEm, {codepoint: advanceWidth}) for a TTF, cached per file."""
+
+    cached = _FONT_METRICS_CACHE.get(fontfile)
+    if cached is not None:
+        return cached
+    from fontTools.ttLib import TTFont
+
+    font = TTFont(fontfile)
+    try:
+        units_per_em = int(font["head"].unitsPerEm)
+        hmtx = font["hmtx"]
+        advances: dict[int, int] = {
+            int(codepoint): int(hmtx[glyph_name][0])
+            for codepoint, glyph_name in font.getBestCmap().items()
+        }
+    finally:
+        font.close()
+    metrics = (units_per_em, advances)
+    _FONT_METRICS_CACHE[fontfile] = metrics
+    return metrics
+
+
+def _measure_overlay_width_px(text: str, fontfile: str, fontsize: int) -> float:
+    """Sum of glyph advances for ``text`` at ``fontsize`` in px (kerning ignored).
+
+    advance_px = advanceWidth * fontsize / unitsPerEm. Missing glyphs fall back
+    to the space advance so an exotic character never measures as zero width.
+    """
+
+    units_per_em, advances = _font_metrics(fontfile)
+    if units_per_em <= 0:
+        return 0.0
+    fallback = advances.get(ord(" "), units_per_em // 2)
+    total_units = sum(advances.get(ord(char), fallback) for char in text)
+    return total_units * fontsize / units_per_em
+
+
+def _fit_overlay_fontsize(text: str, style: OverlayStyle) -> int:
+    """Largest integer fontsize <= base whose rendered width fits the frame.
+
+    Rendered width is the glyph advance sum plus 2*borderw (the border sits
+    outside drawtext's text_w). Width scales linearly with fontsize, so the
+    ideal size is base * glyph_budget / width_at_base. Result is floored at
+    OVERLAY_MIN_FONTSIZE; the caller warns when even the floor overflows.
+    """
+
+    base_fontsize = style["fontsize"]
+    glyph_budget = _overlay_budget_px() - 2 * style["borderw"]
+    width_at_base = _measure_overlay_width_px(text, style["fontfile"], base_fontsize)
+    if width_at_base <= glyph_budget:
+        return base_fontsize
+    ideal = base_fontsize * glyph_budget / width_at_base
+    return max(OVERLAY_MIN_FONTSIZE, min(base_fontsize, int(ideal)))
+
+
+def _prepare_overlay(
+    directory: Path,
+    *,
+    job_id: str,
+    clip_id: str,
+    asset: AssetName,
+    field: str,
+    text: str | None,
+    base_style: OverlayStyle,
+) -> TextOverlay | None:
+    """Measure, shrink-to-fit, log, and materialize one overlay (or None)."""
+
+    if text is None:
+        logger.info(
+            "assemble[%s]: clip=%s asset=%s no overlay text; skipping drawtext",
+            job_id,
+            clip_id,
+            asset,
+        )
+        return None
+
+    base_fontsize = base_style["fontsize"]
+    fontfile = base_style["fontfile"]
+    budget = _overlay_budget_px()
+    border = 2 * base_style["borderw"]
+    width_at_base = _measure_overlay_width_px(text, fontfile, base_fontsize)
+    fontsize = _fit_overlay_fontsize(text, base_style)
+
+    if fontsize < base_fontsize:
+        logger.info(
+            "assemble[%s]: clip=%s asset=%s overlay shrink: len=%d "
+            "width@%d=%.1fpx (+%dpx border) budget=%.0fpx -> fontsize=%d",
+            job_id,
+            clip_id,
+            asset,
+            len(text),
+            base_fontsize,
+            width_at_base,
+            border,
+            budget,
+            fontsize,
+        )
+        rendered = _measure_overlay_width_px(text, fontfile, fontsize) + border
+        if rendered > budget:
+            logger.warning(
+                "assemble[%s]: clip=%s asset=%s overlay STILL overflows at "
+                "floor fontsize=%d: rendered=%.1fpx > budget=%.0fpx; "
+                "proceeding (text may be clipped)",
+                job_id,
+                clip_id,
+                asset,
+                fontsize,
+                rendered,
+                budget,
+            )
+
+    style = cast(OverlayStyle, {**base_style, "fontsize": fontsize})
+    return _write_overlay_textfile(directory, field, text, style)
 
 
 def _generated_s3_key(

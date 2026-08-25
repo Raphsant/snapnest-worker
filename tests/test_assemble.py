@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import re
 import shutil
 import subprocess
@@ -890,6 +891,72 @@ def test_hook_text_with_percent_renders_literally(tmp_path: Path) -> None:
     # Text stays in the file, not inlined into the filter graph.
     assert f"textfile='{overlay.textfile}'" in filter_string
     assert "80%" not in filter_string
+
+
+def test_measure_overlay_width_matches_known_glyph() -> None:
+    # Montserrat ExtraBold 'W' advance at fontsize 72 is ~85.25px (fontTools).
+    style = CONFIG["close_overlay"]
+    width = assemble._measure_overlay_width_px("W", style["fontfile"], 72)
+    assert abs(width - 85.25) <= 0.5
+
+
+def test_close_overlay_shrinks_to_fit_frame() -> None:
+    # The confirmed overflow specimen in Montserrat ExtraBold: must shrink below
+    # 72 and the rendered width (incl. border) must fit the 972px usable frame.
+    text = "MOLDEA TU ZONA DE CONFORT"
+    style = CONFIG["close_overlay"]
+
+    fontsize = assemble._fit_overlay_fontsize(text, style)
+
+    assert 40 <= fontsize < style["fontsize"]
+    rendered = (
+        assemble._measure_overlay_width_px(text, style["fontfile"], fontsize)
+        + 2 * style["borderw"]
+    )
+    assert rendered <= 972
+
+
+def test_hook_overlay_specimen_fits_without_shrink() -> None:
+    # The same string in Anton (condensed) fits at the base size -- no shrink.
+    text = "MOLDEA TU ZONA DE CONFORT"
+    style = CONFIG["hook_overlay"]
+
+    assert assemble._fit_overlay_fontsize(text, style) == style["fontsize"]
+
+
+def test_short_overlay_keeps_base_fontsize() -> None:
+    for style in (CONFIG["hook_overlay"], CONFIG["close_overlay"]):
+        assert assemble._fit_overlay_fontsize("GG", style) == style["fontsize"]
+
+
+def test_pathological_overlay_floors_at_min_fontsize(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    # A 60-char all-'W' string can't fit even at the floor; the assembler must
+    # clamp to fontsize 40 and WARN rather than clip silently.
+    text = "W" * 60
+    style = CONFIG["close_overlay"]
+
+    assert assemble._fit_overlay_fontsize(text, style) == 40
+
+    with caplog.at_level(logging.WARNING):
+        overlay = assemble._prepare_overlay(
+            tmp_path,
+            job_id="job-x",
+            clip_id="clip_03",
+            asset="outro",
+            field="close_text",
+            text=text,
+            base_style=style,
+        )
+
+    assert overlay is not None
+    assert overlay.style["fontsize"] == 40
+    assert overlay.textfile.read_bytes() == text.encode("utf-8")
+    assert any(
+        r.levelno == logging.WARNING and "STILL overflows" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def test_boundary_fade_command_argv(tmp_path: Path) -> None:
