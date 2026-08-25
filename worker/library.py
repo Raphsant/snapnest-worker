@@ -239,7 +239,7 @@ def _validate_asset(raw_asset: object, index: int) -> LibraryAsset:
 
 def _string_tuple(value: object, asset_id: str, field: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(
-        isinstance(item, str) and item for item in cast(list[Any], value)
+        isinstance(item, str) and item for item in value
     ):
         raise ValueError(
             f"library catalog asset {asset_id!r} {field} must be a list of "
