@@ -1,15 +1,16 @@
-"""Creative stage: generate prompts and captions for approved clips."""
+"""Creative stage: select library assets and write captions for approved clips."""
 
 from __future__ import annotations
 
 import copy
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Set as AbstractSet
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from worker import jobs
+from worker.library import LibraryCatalog, format_for_prompt
 from worker.lint import lint_prompts
 
 if TYPE_CHECKING:
@@ -20,12 +21,14 @@ logger = logging.getLogger(__name__)
 
 MAX_TOKENS = 16000
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "creative_system.md"
+# Literal token in creative_system.md replaced with the formatted asset library.
+ASSET_LIBRARY_TOKEN = "{{ASSET_LIBRARY}}"
 REQUIRED_RESPONSE_FIELDS: tuple[str, ...] = (
     "hook_angle",
     "hook_text",
-    "hook_prompt",
+    "hook_asset_id",
     "close_text",
-    "close_prompt",
+    "outro_asset_id",
     "caption_youtube",
     "caption_tiktok",
     "caption_instagram",
@@ -49,13 +52,15 @@ class CreativeError(RuntimeError):
 
 
 def run_creative(ctx: StageContext) -> None:
-    """Generate creative fields for every approved clip, then pause for review."""
+    """Select assets and write creative fields per approved clip, then pause."""
 
     manifest, approved_clips = validate_creative_manifest(ctx.job.manifest)
-    system_prompt = load_system_prompt()
+    catalog = _load_catalog(ctx)
+    system_prompt = load_system_prompt(catalog)
     client = _anthropic_client(ctx.config)
 
     generated: list[tuple[dict[str, Any], dict[str, str]]] = []
+    used_ids: set[str] = set()
     for clip in approved_clips:
         clip_id = _required_clip_string(clip, "id")
         category = _required_clip_string(clip, "category")
@@ -66,22 +71,29 @@ def run_creative(ctx: StageContext) -> None:
                 client,
                 model=ctx.config.creative_model,
                 system_prompt=system_prompt,
+                catalog=catalog,
                 clip_id=clip_id,
                 category=category,
                 transcript=transcript,
+                used_ids=used_ids,
             )
         except Exception as exc:
             raise CreativeError(f"creative: clip {clip_id} failed: {exc}") from exc
 
         _log_package_warnings(ctx.job.id, clip_id, package)
         logger.info(
-            "creative[%s]: clip=%s hook_angle=%s compliance=%s response_bytes=%d",
+            "creative[%s]: clip=%s hook_angle=%s hook_asset=%s outro_asset=%s "
+            "compliance=%s response_bytes=%d",
             ctx.job.id,
             clip_id,
             package["hook_angle"],
+            package["hook_asset_id"],
+            package["outro_asset_id"],
             package["compliance_check"],
             response_size,
         )
+        used_ids.add(package["hook_asset_id"])
+        used_ids.add(package["outro_asset_id"])
         generated.append((clip, package))
 
     # Do not mutate even the in-memory manifest until every approved clip has a
@@ -89,10 +101,9 @@ def run_creative(ctx: StageContext) -> None:
     for clip, package in generated:
         clip.update(compose_manifest_fields(package))
 
-    # Enforcement choke point #1: lint the just-composed prompts and record any
-    # violations in the manifest so the operator sees them in the dashboard and
-    # rejects/regenerates. This state fires ZERO Higgsfield calls; the generate
-    # stage re-lints and hard-fails before spending credits (worker.lint).
+    # Enforcement choke point #1, retained for stale manifests: v2 composes no
+    # generation prompts, but a pre-v2 manifest may still carry dirty
+    # hook_prompt/close_prompt fields — lint records them for operator review.
     lint = lint_prompts(manifest)
     manifest["lint_violations"] = lint.violations
     manifest["lint_warnings"] = lint.warnings
@@ -131,10 +142,16 @@ def run_creative(ctx: StageContext) -> None:
     )
 
 
-def load_system_prompt() -> str:
-    """Load the creative system prompt byte-for-byte."""
+def load_system_prompt(catalog: LibraryCatalog) -> str:
+    """Load the creative system prompt and inject the asset library catalog."""
 
-    return PROMPT_PATH.read_text(encoding="utf-8")
+    template = PROMPT_PATH.read_text(encoding="utf-8")
+    if ASSET_LIBRARY_TOKEN not in template:
+        raise CreativeError(
+            f"creative: system prompt is missing the {ASSET_LIBRARY_TOKEN} "
+            "placeholder"
+        )
+    return template.replace(ASSET_LIBRARY_TOKEN, format_for_prompt(catalog))
 
 
 # --------------------------------------------------------------------------- #
@@ -171,22 +188,68 @@ def validate_creative_json(data: object) -> dict[str, str]:
     return validated
 
 
+def validate_asset_selection(
+    package: Mapping[str, str],
+    catalog: LibraryCatalog,
+    *,
+    category: str,
+    clip_id: str,
+    used_ids: AbstractSet[str] = frozenset(),
+) -> None:
+    """Require selected ids to exist, match type, and be unused in this batch.
+
+    A missing id, a type mismatch, or an id already selected for another clip
+    raises ValueError (feeding the repair retry). A clip category absent from
+    the asset's categories is only a warning: universal assets legitimately
+    cross categories.
+    """
+
+    for field, expected_type in (
+        ("hook_asset_id", "hook"),
+        ("outro_asset_id", "outro"),
+    ):
+        asset_id = package[field]
+        asset = catalog.get(asset_id)
+        if asset is None:
+            raise ValueError(
+                f"{field} {asset_id!r} does not exist in the asset library"
+            )
+        if asset.type != expected_type:
+            raise ValueError(
+                f"{field} {asset_id!r} has type {asset.type!r}, "
+                f"expected {expected_type!r}"
+            )
+        if asset_id in used_ids:
+            raise ValueError(
+                f"{field} {asset_id!r} was already selected in this batch "
+                f"(used: {', '.join(sorted(used_ids))})"
+            )
+        if category not in asset.category:
+            logger.warning(
+                "creative: clip=%s %s=%s clip category %r not in asset "
+                "categories %s (cross-category selection allowed)",
+                clip_id,
+                field,
+                asset_id,
+                category,
+                list(asset.category),
+            )
+
+
 def compose_manifest_fields(package: Mapping[str, str]) -> dict[str, str]:
     """Compose the manifest fields written to each approved clip.
 
     Emits native overlay copy (hook_text/close_text) consumed by the
-    assembler's drawtext, the CLEAN generation prompts consumed by the generate
-    stage (verbatim from the model — no on-screen-text prefix), and the
-    platform post copy. The overlay words live ONLY in hook_text/close_text,
-    never inside a prompt (see worker.lint and creative_system.md
-    generation_prompt_purity).
+    assembler's drawtext, the selected library asset ids (hooks/outros are
+    pre-generated — no generation prompts are written), and the platform
+    post copy.
     """
 
     return {
         "hook_text": package["hook_text"],
-        "hook_prompt": package["hook_prompt"],
+        "hook_asset_id": package["hook_asset_id"],
         "close_text": package["close_text"],
-        "close_prompt": package["close_prompt"],
+        "outro_asset_id": package["outro_asset_id"],
         "post_copy": (
             f'### YouTube Shorts\n{package["caption_youtube"]}\n\n'
             f'### TikTok\n{package["caption_tiktok"]}\n\n'
@@ -240,6 +303,24 @@ def _required_clip_string(clip: Mapping[str, object], field: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# S3 (catalog load)
+# --------------------------------------------------------------------------- #
+
+
+def _load_catalog(ctx: StageContext) -> LibraryCatalog:
+    """Load the asset library catalog; the stage cannot run without it."""
+
+    try:
+        return LibraryCatalog.from_s3(
+            ctx.workspace.s3, ctx.workspace.bucket, ctx.config.library_prefix
+        )
+    except Exception as exc:
+        raise CreativeError(
+            f"creative: asset library catalog unavailable or invalid: {exc}"
+        ) from exc
+
+
+# --------------------------------------------------------------------------- #
 # Anthropic (thin, side-effecting wrappers)
 # --------------------------------------------------------------------------- #
 
@@ -255,17 +336,24 @@ def _generate_clip_package(
     *,
     model: str,
     system_prompt: str,
+    catalog: LibraryCatalog,
     clip_id: str,
     category: str,
     transcript: str,
+    used_ids: AbstractSet[str] = frozenset(),
 ) -> tuple[dict[str, str], int]:
-    """Call Creative for one clip, with one parse/validation repair retry."""
+    """Call Creative for one clip, with one parse/validation/selection repair retry."""
 
     user = (
         f"CLIP ID: {clip_id}\n"
         f"CATEGORY: {category}\n\n"
         f"TRANSCRIPT:\n{transcript}"
     )
+    if used_ids:
+        user += (
+            "\n\nALREADY SELECTED IN THIS BATCH (do not reuse): "
+            + ", ".join(sorted(used_ids))
+        )
     messages = [{"role": "user", "content": user}]
 
     first = _create_message(
@@ -276,7 +364,13 @@ def _generate_clip_package(
     )
     first_text = _message_text(first)
     try:
-        package = validate_creative_json(extract_json(first_text))
+        package = _validated_package(
+            first_text,
+            catalog,
+            category=category,
+            clip_id=clip_id,
+            used_ids=used_ids,
+        )
         return package, len(first_text.encode("utf-8"))
     except ValueError as first_error:
         error_description = str(first_error)
@@ -302,12 +396,35 @@ def _generate_clip_package(
     )
     second_text = _message_text(second)
     try:
-        package = validate_creative_json(extract_json(second_text))
+        package = _validated_package(
+            second_text,
+            catalog,
+            category=category,
+            clip_id=clip_id,
+            used_ids=used_ids,
+        )
     except ValueError as second_error:
         raise ValueError(
             f"validation failed after corrective retry: {second_error}"
         ) from second_error
     return package, len(second_text.encode("utf-8"))
+
+
+def _validated_package(
+    text: str,
+    catalog: LibraryCatalog,
+    *,
+    category: str,
+    clip_id: str,
+    used_ids: AbstractSet[str],
+) -> dict[str, str]:
+    """Parse, shape-validate, and selection-validate one model response."""
+
+    package = validate_creative_json(extract_json(text))
+    validate_asset_selection(
+        package, catalog, category=category, clip_id=clip_id, used_ids=used_ids
+    )
+    return package
 
 
 def _create_message(

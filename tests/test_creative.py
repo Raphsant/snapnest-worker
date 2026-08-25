@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -11,25 +13,66 @@ from psycopg import Connection
 from psycopg.rows import DictRow
 
 from worker.jobs import Job
+from worker.library import LibraryCatalog
 from worker.stages import StageContext
 from worker.stages.creative import (
     CreativeError,
     compose_manifest_fields,
     extract_json,
+    load_system_prompt,
     run_creative,
+    validate_asset_selection,
     validate_creative_json,
     validate_creative_manifest,
 )
 from worker.workspace import Workspace
 
 
+def _catalog() -> LibraryCatalog:
+    def hook(asset_id: str) -> dict[str, Any]:
+        return {
+            "id": asset_id,
+            "type": "hook",
+            "s3_key": f"library/hooks/{asset_id}.mp4",
+            "duration_s": 4.0,
+            "category": ["mindset"],
+            "tags": ["psychology", "intensity"],
+            "character": "zombie_trader",
+            "description": "Zombie trader slams desk as charts crash",
+            "times_used": 0,
+        }
+
+    def outro(asset_id: str) -> dict[str, Any]:
+        return {
+            "id": asset_id,
+            "type": "outro",
+            "s3_key": f"library/outros/{asset_id}.mp4",
+            "duration_s": 5.0,
+            "category": ["mindset"],
+            "tags": ["calm", "premium"],
+            "character": None,
+            "description": "Calm dark studio close with baked logo",
+            "times_used": 0,
+            "logo_baked": True,
+        }
+
+    return LibraryCatalog.from_dict(
+        {
+            "version": 1,
+            "updated_at": "2026-08-25T00:00:00Z",
+            "notes": "Prefer unused assets; H10/O04 are universal fallbacks.",
+            "assets": [hook("H01"), hook("H02"), outro("O01"), outro("O02")],
+        }
+    )
+
+
 def _package() -> dict[str, str]:
     return {
         "hook_angle": "discipline",
         "hook_text": "TRATA EL TRADING EN SERIO",
-        "hook_prompt": "Cinematic trading floor, fast push-in, high contrast.",
+        "hook_asset_id": "H01",
         "close_text": "EL PROCESO ES LA VENTAJA",
-        "close_prompt": "Calm, premium resolve on an uncluttered desk.",
+        "outro_asset_id": "O01",
         "caption_youtube": "Lección de proceso. Suscríbete. #trading",
         "caption_tiktok": "La disciplina se practica. #trading",
         "caption_instagram": "¿Tienes un proceso? Zombie Hour LIVE. #trading",
@@ -60,20 +103,84 @@ def test_validate_creative_json_rejects_missing_or_empty_fields(
 ) -> None:
     package: dict[str, object] = {}
     package.update(_package())
-    package["hook_prompt"] = bad_value
+    package["hook_asset_id"] = bad_value
 
-    with pytest.raises(ValueError, match="hook_prompt"):
+    with pytest.raises(ValueError, match="hook_asset_id"):
         validate_creative_json(package)
 
 
-def test_compose_manifest_fields_emits_native_text_and_clean_prompts() -> None:
+def test_validate_asset_selection_unknown_id_raises() -> None:
+    package = _package()
+    package["hook_asset_id"] = "H99"
+
+    with pytest.raises(ValueError, match="hook_asset_id 'H99' does not exist"):
+        validate_asset_selection(
+            package, _catalog(), category="mindset", clip_id="clip_01"
+        )
+
+
+def test_validate_asset_selection_wrong_type_raises() -> None:
+    package = _package()
+    package["hook_asset_id"] = "O01"
+
+    with pytest.raises(ValueError, match="has type 'outro', expected 'hook'"):
+        validate_asset_selection(
+            package, _catalog(), category="mindset", clip_id="clip_01"
+        )
+
+
+def test_validate_asset_selection_reused_id_raises() -> None:
+    with pytest.raises(
+        ValueError, match="'H01' was already selected in this batch"
+    ):
+        validate_asset_selection(
+            _package(),
+            _catalog(),
+            category="mindset",
+            clip_id="clip_02",
+            used_ids={"H01", "O02"},
+        )
+
+
+def test_validate_asset_selection_category_mismatch_warns_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING", logger="worker.stages.creative"):
+        validate_asset_selection(
+            _package(), _catalog(), category="technical", clip_id="clip_01"
+        )
+
+    assert "cross-category selection allowed" in caplog.text
+
+
+def test_load_system_prompt_substitutes_catalog() -> None:
+    rendered = load_system_prompt(_catalog())
+
+    assert "{{ASSET_LIBRARY}}" not in rendered
+    assert "H01 [hook] (mindset)" in rendered
+    assert "H10/O04 are universal fallbacks." in rendered
+
+
+def test_load_system_prompt_errors_without_token(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    stub = tmp_path / "creative_system.md"
+    stub.write_text("a prompt with no placeholder", encoding="utf-8")
+    monkeypatch.setattr("worker.stages.creative.PROMPT_PATH", stub)
+
+    with pytest.raises(CreativeError, match="ASSET_LIBRARY"):
+        load_system_prompt(_catalog())
+
+
+def test_compose_manifest_fields_emits_overlay_text_and_asset_ids() -> None:
     fields = compose_manifest_fields(_package())
 
     assert fields == {
         "hook_text": "TRATA EL TRADING EN SERIO",
-        "hook_prompt": "Cinematic trading floor, fast push-in, high contrast.",
+        "hook_asset_id": "H01",
         "close_text": "EL PROCESO ES LA VENTAJA",
-        "close_prompt": "Calm, premium resolve on an uncluttered desk.",
+        "outro_asset_id": "O01",
         "post_copy": (
             "### YouTube Shorts\n"
             "Lección de proceso. Suscríbete. #trading\n\n"
@@ -84,6 +191,8 @@ def test_compose_manifest_fields_emits_native_text_and_clean_prompts() -> None:
             "Compliance check: PASS"
         ),
     }
+    assert "hook_prompt" not in fields
+    assert "close_prompt" not in fields
 
 
 def test_validate_creative_manifest_copies_and_selects_only_approved() -> None:
@@ -113,12 +222,12 @@ def test_validate_creative_manifest_copies_and_selects_only_approved() -> None:
     }
 
     copied, approved = validate_creative_manifest(manifest)
-    approved[0]["hook_prompt"] = "generated"
+    approved[0]["hook_asset_id"] = "H01"
 
     assert approved[0]["transcript"] == transcript
     assert len(approved) == 1
-    assert manifest["clips"][0]["hook_prompt"] is None
-    assert copied["clips"][1]["hook_prompt"] is None
+    assert "hook_asset_id" not in manifest["clips"][0]
+    assert "hook_asset_id" not in copied["clips"][1]
 
 
 @pytest.mark.parametrize(
@@ -138,7 +247,7 @@ def test_validate_creative_manifest_rejects_invalid_inputs(
 
 
 # --------------------------------------------------------------------------- #
-# run_creative: choke point #1 (native overlay fields + lint wiring at the gate)
+# run_creative: selection wiring, dedup, and the creative gate
 # --------------------------------------------------------------------------- #
 
 
@@ -169,12 +278,26 @@ class _FakeCreativeContext:
     checkpoint_heartbeat: Callable[[], None] = _noop_heartbeat
 
 
-def _approved_manifest() -> dict[str, Any]:
+class _FakeMessages:
+    """Anthropic messages stub: records create() kwargs, replays canned texts."""
+
+    def __init__(self, texts: list[str]) -> None:
+        self._texts = list(texts)
+        self.calls: list[dict[str, Any]] = []
+
+    def create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=self._texts.pop(0))]
+        )
+
+
+def _approved_manifest(clip_ids: tuple[str, ...] = ("clip_01",)) -> dict[str, Any]:
     return {
         "status": "approved",
         "clips": [
             {
-                "id": "clip_01",
+                "id": clip_id,
                 "approved": True,
                 "category": "mindset",
                 "transcript": "Algo importante dijo Eduardo.",
@@ -182,17 +305,12 @@ def _approved_manifest() -> dict[str, Any]:
                 "close_prompt": None,
                 "post_copy": None,
             }
+            for clip_id in clip_ids
         ],
     }
 
 
-def _run_creative_capture(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    *,
-    manifest: dict[str, Any],
-    package: dict[str, str],
-) -> tuple[dict[str, Any], _FakeS3]:
+def _patch_common(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     saved: dict[str, Any] = {}
 
     def fake_save(
@@ -205,14 +323,15 @@ def _run_creative_capture(
         fake_save,
     )
     monkeypatch.setattr(
-        "worker.stages.creative._anthropic_client",
-        lambda cfg: object(),
+        "worker.stages.creative._load_catalog",
+        lambda ctx: _catalog(),
     )
-    monkeypatch.setattr(
-        "worker.stages.creative._generate_clip_package",
-        lambda *args, **kwargs: (dict(package), 123),
-    )
+    return saved
 
+
+def _make_ctx(
+    tmp_path: Path, manifest: dict[str, Any]
+) -> tuple[_FakeCreativeContext, _FakeS3, Workspace]:
     fake_s3 = _FakeS3()
     job = Job(
         id="job-1",
@@ -232,12 +351,33 @@ def _run_creative_capture(
         conn=cast(Connection[DictRow], object()),
         config=_FakeConfig(),
     )
+    return ctx, fake_s3, workspace
+
+
+def _run_creative_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    manifest: dict[str, Any],
+    package: dict[str, str],
+) -> tuple[dict[str, Any], _FakeS3]:
+    saved = _patch_common(monkeypatch)
+    monkeypatch.setattr(
+        "worker.stages.creative._anthropic_client",
+        lambda cfg: object(),
+    )
+    monkeypatch.setattr(
+        "worker.stages.creative._generate_clip_package",
+        lambda *args, **kwargs: (dict(package), 123),
+    )
+
+    ctx, fake_s3, workspace = _make_ctx(tmp_path, manifest)
     with workspace:
         run_creative(cast(StageContext, ctx))
     return saved["manifest"], fake_s3
 
 
-def test_run_creative_emits_native_overlay_text_and_clean_prompts(
+def test_run_creative_emits_overlay_text_and_asset_selections(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -251,54 +391,71 @@ def test_run_creative_emits_native_overlay_text_and_clean_prompts(
     clip = saved["clips"][0]
     assert clip["hook_text"] == "TRATA EL TRADING EN SERIO"
     assert clip["close_text"] == "EL PROCESO ES LA VENTAJA"
-    assert clip["hook_prompt"] == (
-        "Cinematic trading floor, fast push-in, high contrast."
-    )
-    assert clip["close_prompt"] == "Calm, premium resolve on an uncluttered desk."
+    assert clip["hook_asset_id"] == "H01"
+    assert clip["outro_asset_id"] == "O01"
+    # v2 writes no generation prompts; the legacy keys stay untouched (None).
+    assert clip["hook_prompt"] is None
+    assert clip["close_prompt"] is None
     assert saved["lint_violations"] == []
+    assert saved["lint_warnings"] == []
     assert "pipeline/job-1/manifest.json" in fake_s3.uploads
 
 
-def test_run_creative_records_lint_violations_at_the_gate(
+def test_run_creative_still_lints_stale_prompt_fields(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    dirty = _package()
-    dirty["hook_prompt"] = "Push in as the STC logo animates in."
+    # A pre-v2 manifest can still carry a dirty legacy hook_prompt; the gate
+    # lint keeps recording it for operator review even though v2 writes none.
+    manifest = _approved_manifest()
+    manifest["clips"][0]["hook_prompt"] = "Push in as the STC logo animates in."
 
     saved, _ = _run_creative_capture(
         monkeypatch,
         tmp_path,
-        manifest=_approved_manifest(),
-        package=dirty,
+        manifest=manifest,
+        package=_package(),
     )
 
     violations = saved["lint_violations"]
     assert {v["field"] for v in violations} == {"hook_prompt"}
     assert {v["matched_word"].lower() for v in violations} == {"stc", "logo"}
-    # Recorded for operator review, NOT raised: the job still parks at the
-    # creative gate with the native overlay text in place.
-    assert saved["clips"][0]["hook_text"] == "TRATA EL TRADING EN SERIO"
 
 
-def test_run_creative_records_negated_lint_warnings_at_the_gate(
+def test_run_creative_two_clips_dedups_selections(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    # A negated branding word is recorded as a non-blocking warning, not a
-    # blocking violation — so creative v2's "no logos" phrasings don't wedge.
-    negated = _package()
-    negated["hook_prompt"] = "Clean trading floor, no logos, plain background."
-
-    saved, _ = _run_creative_capture(
-        monkeypatch,
-        tmp_path,
-        manifest=_approved_manifest(),
-        package=negated,
+    saved = _patch_common(monkeypatch)
+    packages = [
+        _package(),
+        {**_package(), "hook_asset_id": "H02", "outro_asset_id": "O02"},
+    ]
+    fake_messages = _FakeMessages([json.dumps(p) for p in packages])
+    monkeypatch.setattr(
+        "worker.stages.creative._anthropic_client",
+        lambda cfg: SimpleNamespace(messages=fake_messages),
     )
 
-    assert saved["lint_violations"] == []
-    warnings = saved["lint_warnings"]
-    assert {w["field"] for w in warnings} == {"hook_prompt"}
-    assert {w["matched_word"].lower() for w in warnings} == {"logos"}
-    assert all(w["negated"] is True for w in warnings)
+    ctx, _, workspace = _make_ctx(
+        tmp_path, _approved_manifest(("clip_01", "clip_02"))
+    )
+    with workspace:
+        run_creative(cast(StageContext, ctx))
+
+    first_user = fake_messages.calls[0]["messages"][0]["content"]
+    second_user = fake_messages.calls[1]["messages"][0]["content"]
+    assert "ALREADY SELECTED" not in first_user
+    assert (
+        "ALREADY SELECTED IN THIS BATCH (do not reuse): H01, O01" in second_user
+    )
+
+    clips = saved["manifest"]["clips"]
+    assert (clips[0]["hook_asset_id"], clips[0]["outro_asset_id"]) == (
+        "H01",
+        "O01",
+    )
+    assert (clips[1]["hook_asset_id"], clips[1]["outro_asset_id"]) == (
+        "H02",
+        "O02",
+    )
