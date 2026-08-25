@@ -1,4 +1,4 @@
-"""Generation-prompt lint: reject logo/brand/text language before Higgsfield.
+"""Manifest lint: prompt purity (legacy) and library selection validity.
 
 CLAUDE.md iron rule #1: AI stages generate CLEAN footage; the deterministic
 assembler applies ALL branding, text overlays, and captions. Generation prompts
@@ -13,6 +13,12 @@ Negation-aware (v1.1): a blocklisted word used inside a prohibition ("no logos",
 describe cleanliness by naming what to avoid don't hard-fail. "STC" is the
 exception: the letters appearing at all is the violation, even negated.
 
+Selection lint (v2): creative selects pre-generated library assets
+(hook_asset_id/outro_asset_id) instead of writing prompts. Operators can edit
+the manifest between the creative gate and generation, so ``lint_selections``
+re-validates every approved clip's selections against the catalog at both
+choke points.
+
 Pure functions only — no DB, S3, Anthropic, or Higgsfield side effects.
 """
 
@@ -21,12 +27,22 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from worker.library import LibraryCatalog
 
 # Only generation-prompt fields are linted. hook_text / close_text are overlay
 # copy consumed by the assembler's drawtext — they are EXEMPT (the words belong
 # there, never inside a generation prompt).
 GENERATION_PROMPT_FIELDS: tuple[str, ...] = ("hook_prompt", "close_prompt")
+
+# Library selection fields written by creative v2, with the asset type each
+# must resolve to in the catalog.
+SELECTION_FIELDS: tuple[tuple[str, str], ...] = (
+    ("hook_asset_id", "hook"),
+    ("outro_asset_id", "outro"),
+)
 
 # Words that request rendered branding or on-screen text. This is the one
 # obvious place to extend the policy — add a token and it is enforced at both
@@ -151,6 +167,103 @@ def lint_prompts(manifest: Mapping[str, Any]) -> LintResult:
                         "negated": True,
                     }
                 )
+    return LintResult(violations=violations, warnings=warnings)
+
+
+def lint_selections(
+    manifest: Mapping[str, Any], catalog: LibraryCatalog
+) -> LintResult:
+    """Validate approved clips' library selections against the catalog.
+
+    Same result shape as ``lint_prompts``, with entries of
+    ``{clipId, field, reason}``. Violations (the generate stage hard-fails on
+    these): a missing/empty selection field, an id absent from the catalog, an
+    id of the wrong type, or the same id selected by more than one approved
+    clip (every clip involved is reported, hook and outro fields checked
+    jointly). Warnings (recorded only): the clip's category not being in the
+    selected asset's category list — universal assets legitimately cross
+    categories. Unapproved clips are ignored entirely; a structurally
+    unusable manifest yields an empty result, as in ``lint_prompts``.
+    """
+
+    clips = manifest.get("clips")
+    if not isinstance(clips, list):
+        return LintResult(violations=[], warnings=[])
+
+    violations: list[dict[str, str]] = []
+    warnings: list[dict[str, Any]] = []
+    selected_by: dict[str, list[tuple[str, str]]] = {}
+    for clip in clips:
+        if not isinstance(clip, Mapping):
+            continue
+        if clip.get("approved") is not True:
+            continue
+        clip_id = str(clip.get("id", "<unknown>"))
+        category = clip.get("category")
+        for field, expected_type in SELECTION_FIELDS:
+            value = clip.get(field)
+            if not isinstance(value, str) or not value.strip():
+                violations.append(
+                    {
+                        "clipId": clip_id,
+                        "field": field,
+                        "reason": f"{field} must be a non-empty asset id",
+                    }
+                )
+                continue
+            asset = catalog.get(value)
+            if asset is None:
+                violations.append(
+                    {
+                        "clipId": clip_id,
+                        "field": field,
+                        "reason": (
+                            f"asset id {value!r} does not exist in the "
+                            "library catalog"
+                        ),
+                    }
+                )
+                continue
+            if asset.type != expected_type:
+                violations.append(
+                    {
+                        "clipId": clip_id,
+                        "field": field,
+                        "reason": (
+                            f"asset {value!r} has type {asset.type!r}, "
+                            f"expected {expected_type!r}"
+                        ),
+                    }
+                )
+                continue
+            selected_by.setdefault(value, []).append((clip_id, field))
+            if isinstance(category, str) and category not in asset.category:
+                warnings.append(
+                    {
+                        "clipId": clip_id,
+                        "field": field,
+                        "reason": (
+                            f"clip category {category!r} not in asset "
+                            f"{value!r} categories {list(asset.category)}"
+                        ),
+                    }
+                )
+
+    for asset_id, users in selected_by.items():
+        if len(users) < 2:
+            continue
+        usage = ", ".join(f"{c}.{f}" for c, f in users)
+        for clip_id, field in users:
+            violations.append(
+                {
+                    "clipId": clip_id,
+                    "field": field,
+                    "reason": (
+                        f"asset {asset_id!r} selected by multiple approved "
+                        f"clips ({usage})"
+                    ),
+                }
+            )
     return LintResult(violations=violations, warnings=warnings)
 
 

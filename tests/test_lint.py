@@ -4,7 +4,13 @@ from typing import Any
 
 import pytest
 
-from worker.lint import GENERATION_PROMPT_FIELDS, lint_prompts
+from worker.library import LibraryCatalog
+from worker.lint import (
+    GENERATION_PROMPT_FIELDS,
+    SELECTION_FIELDS,
+    lint_prompts,
+    lint_selections,
+)
 
 
 def _manifest(**clip_fields: object) -> dict[str, object]:
@@ -216,3 +222,158 @@ def test_negation_cue_does_not_leak_across_a_sentence_boundary() -> None:
 
     assert [v["matched_word"].lower() for v in _hook_violations(prompt)] == ["logo"]
     assert [w["matched_word"].lower() for w in _hook_warnings(prompt)] == ["branding"]
+
+
+# --- library selection lint (v2) ------------------------------------------- #
+
+
+def _selection_catalog() -> LibraryCatalog:
+    def asset(asset_id: str, asset_type: str) -> dict[str, Any]:
+        return {
+            "id": asset_id,
+            "type": asset_type,
+            "s3_key": f"library/{asset_type}s/{asset_id}.mp4",
+            "duration_s": 4.0,
+            "category": ["mindset"],
+            "tags": ["psychology"],
+            "character": None,
+            "description": f"{asset_id} test asset",
+            "times_used": 0,
+        }
+
+    return LibraryCatalog.from_dict(
+        {
+            "version": 1,
+            "updated_at": "2026-08-25T00:00:00Z",
+            "notes": "test notes",
+            "assets": [
+                asset("H01", "hook"),
+                asset("H02", "hook"),
+                asset("O01", "outro"),
+                asset("O02", "outro"),
+            ],
+        }
+    )
+
+
+def _selection_clip(clip_id: str, **fields: object) -> dict[str, object]:
+    clip: dict[str, object] = {
+        "id": clip_id,
+        "approved": True,
+        "category": "mindset",
+        "hook_asset_id": "H01",
+        "outro_asset_id": "O01",
+    }
+    clip.update(fields)
+    return clip
+
+
+def test_valid_selections_yield_empty_result() -> None:
+    manifest = {
+        "clips": [
+            _selection_clip("clip_01"),
+            _selection_clip(
+                "clip_02", hook_asset_id="H02", outro_asset_id="O02"
+            ),
+        ]
+    }
+
+    result = lint_selections(manifest, _selection_catalog())
+    assert result.violations == []
+    assert result.warnings == []
+
+
+@pytest.mark.parametrize("bad_value", [None, "", "   ", 7])
+def test_missing_or_empty_selection_is_a_violation(bad_value: object) -> None:
+    manifest = {"clips": [_selection_clip("clip_01", hook_asset_id=bad_value)]}
+
+    [violation] = lint_selections(manifest, _selection_catalog()).violations
+    assert violation["clipId"] == "clip_01"
+    assert violation["field"] == "hook_asset_id"
+    assert "non-empty asset id" in violation["reason"]
+
+
+def test_unknown_asset_id_is_a_violation() -> None:
+    manifest = {"clips": [_selection_clip("clip_01", outro_asset_id="O99")]}
+
+    [violation] = lint_selections(manifest, _selection_catalog()).violations
+    assert violation["field"] == "outro_asset_id"
+    assert "'O99' does not exist" in violation["reason"]
+
+
+def test_wrong_asset_type_is_a_violation() -> None:
+    manifest = {"clips": [_selection_clip("clip_01", hook_asset_id="O01")]}
+
+    [violation] = lint_selections(manifest, _selection_catalog()).violations
+    assert violation["field"] == "hook_asset_id"
+    assert "has type 'outro', expected 'hook'" in violation["reason"]
+
+
+def test_cross_clip_duplicate_reports_every_offender() -> None:
+    manifest = {
+        "clips": [
+            _selection_clip("clip_01"),
+            _selection_clip("clip_02", outro_asset_id="O02"),  # H01 reused
+            _selection_clip("clip_03", hook_asset_id="H02"),  # O01 reused
+        ]
+    }
+
+    violations = lint_selections(manifest, _selection_catalog()).violations
+    offenders = {(v["clipId"], v["field"]) for v in violations}
+    assert offenders == {
+        ("clip_01", "hook_asset_id"),
+        ("clip_02", "hook_asset_id"),
+        ("clip_01", "outro_asset_id"),
+        ("clip_03", "outro_asset_id"),
+    }
+    # Every duplicate violation names all clips involved for that asset.
+    h01 = [v for v in violations if "'H01'" in v["reason"]]
+    assert all(
+        "clip_01.hook_asset_id" in v["reason"]
+        and "clip_02.hook_asset_id" in v["reason"]
+        for v in h01
+    )
+
+
+def test_category_mismatch_is_a_warning_not_a_violation() -> None:
+    manifest = {"clips": [_selection_clip("clip_01", category="technical")]}
+
+    result = lint_selections(manifest, _selection_catalog())
+    assert result.violations == []
+    assert len(result.warnings) == 2  # both hook and outro are mindset-only
+    assert all("'technical'" in w["reason"] for w in result.warnings)
+    assert {w["field"] for w in result.warnings} == {
+        "hook_asset_id",
+        "outro_asset_id",
+    }
+
+
+def test_unapproved_clips_produce_no_selection_findings() -> None:
+    manifest = {
+        "clips": [
+            _selection_clip(
+                "clip_01",
+                approved=False,
+                hook_asset_id="GARBAGE",
+                outro_asset_id=None,
+            ),
+        ]
+    }
+
+    result = lint_selections(manifest, _selection_catalog())
+    assert result.violations == []
+    assert result.warnings == []
+
+
+@pytest.mark.parametrize("manifest", [{}, {"clips": None}, {"clips": "nope"}])
+def test_structurally_unusable_manifest_yields_no_selection_findings(
+    manifest: dict[str, object],
+) -> None:
+    assert lint_selections(manifest, _selection_catalog()).violations == []
+
+
+def test_selection_fields_constant_shape() -> None:
+    assert SELECTION_FIELDS == (
+        ("hook_asset_id", "hook"),
+        ("outro_asset_id", "outro"),
+    )
