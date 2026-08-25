@@ -797,12 +797,23 @@ def test_generated_segment_command_burns_hook_text_argv(tmp_path: Path) -> None:
         f"textfile='{textfile}':"
         "expansion=none:"
         "fontsize=72:fontcolor=white:borderw=4:bordercolor=black:"
-        "x=(w-text_w)/2:y=h*0.72:enable='gte(t\\,0.5)',"
+        "x=(w-text_w)/2:"
+        "y='h*0.72+30*(1-min(1\\,(t-0.5)/0.4))':"
+        "alpha='min(1\\,max(0\\,(t-0.5)/0.4))':"
+        "enable='gte(t\\,0.5)',"
         "format=yuv420p,setsar=1[v]"
     )
     # expansion=none renders the textfile bytes literally (a bare '%' otherwise
     # blanks the frame under drawtext's default expansion=normal).
     assert "expansion=none" in command[filter_index]
+    # Appearance animation: fade-in plus a rise from rise_px below the resting
+    # line over anim_duration_s.
+    style = CONFIG["hook_overlay"]
+    assert "alpha=" in command[filter_index]
+    assert (
+        f"{style['rise_px']}*(1-min(1\\,(t-0.5)/{style['anim_duration_s']}))"
+        in command[filter_index]
+    )
     # Everything around the filter graph is byte-identical to the v1 command.
     v1_command = build_generated_segment_command(
         source, output, speed=CONFIG["hook_speed"]
@@ -838,11 +849,20 @@ def test_outro_segment_command_burns_close_text_above_logo_argv(
         f"textfile='{textfile}':"
         "expansion=none:"
         "fontsize=72:fontcolor=white:borderw=4:bordercolor=black:"
-        "x=(w-text_w)/2:y=h*0.72:enable='gte(t\\,2.5)',"
+        "x=(w-text_w)/2:"
+        "y='h*0.72+30*(1-min(1\\,(t-2.5)/0.4))':"
+        "alpha='min(1\\,max(0\\,(t-2.5)/0.4))':"
+        "enable='gte(t\\,2.5)',"
         "format=yuv420p,setsar=1[v]"
     )
     # Shared builder -> the close path carries expansion=none too.
     assert "expansion=none" in command[filter_index]
+    style = CONFIG["close_overlay"]
+    assert "alpha=" in command[filter_index]
+    assert (
+        f"{style['rise_px']}*(1-min(1\\,(t-2.5)/{style['anim_duration_s']}))"
+        in command[filter_index]
+    )
 
 
 def test_overlay_textfile_preserves_manifest_bytes(tmp_path: Path) -> None:

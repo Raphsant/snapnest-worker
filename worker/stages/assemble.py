@@ -78,6 +78,8 @@ class OverlayStyle(TypedDict):
     bordercolor: str
     y_fraction: float
     appear_time_s: float
+    anim_duration_s: float
+    rise_px: int
 
 
 class AssembleConfig(TypedDict):
@@ -192,6 +194,8 @@ CONFIG: AssembleConfig = {
         "bordercolor": "black",
         "y_fraction": 0.72,
         "appear_time_s": 0.5,
+        "anim_duration_s": 0.4,
+        "rise_px": 30,
     },
     "close_overlay": {
         "fontfile": str(FONTS_DIR / "Montserrat-ExtraBold.ttf"),
@@ -201,6 +205,8 @@ CONFIG: AssembleConfig = {
         "bordercolor": "black",
         "y_fraction": 0.72,
         "appear_time_s": 2.5,
+        "anim_duration_s": 0.4,
+        "rise_px": 30,
     },
     "ffmpeg_error_tail": 1600,
 }
@@ -1436,6 +1442,14 @@ def _download_to(
 
 def _drawtext_filter(text: TextOverlay) -> str:
     style = text.style
+    appear = style["appear_time_s"]
+    duration = style["anim_duration_s"]
+    # Appearance animation: fade-in (alpha 0->1) plus a gentle rise (text
+    # starts rise_px below its resting line and settles over anim_duration_s).
+    # progress = clamped (t-appear)/duration; enable stays as a coarse gate so
+    # no draw cost is paid before the appear time (alpha alone would draw
+    # invisible text every frame from t=0).
+    progress = f"(t-{appear})/{duration}"
     return (
         f"drawtext=fontfile='{_escape_filter_value(style['fontfile'])}':"
         f"textfile='{_escape_filter_value(str(text.textfile))}':"
@@ -1450,8 +1464,10 @@ def _drawtext_filter(text: TextOverlay) -> str:
         f"borderw={style['borderw']}:"
         f"bordercolor={style['bordercolor']}:"
         "x=(w-text_w)/2:"
-        f"y=h*{style['y_fraction']}:"
-        f"enable='gte(t\\,{style['appear_time_s']})'"
+        f"y='h*{style['y_fraction']}+"
+        f"{style['rise_px']}*(1-min(1\\,{progress}))':"
+        f"alpha='min(1\\,max(0\\,{progress}))':"
+        f"enable='gte(t\\,{appear})'"
     )
 
 

@@ -32,15 +32,16 @@ REQUIRED_RESPONSE_FIELDS: tuple[str, ...] = (
     "compliance_check",
 )
 
-# Overlay copy must fit ONE line of the 9:16 drawtext overlay. These caps are
-# WARNING thresholds only — never a hard failure — which is what makes them
-# safe to ship ahead of the assembler change that re-measures them. They were
-# sized for the pre-v3.1 Arial overlay; v3.1 swaps in Anton for hook_text
-# (heavily condensed -> more chars fit) and Montserrat ExtraBold for close_text
-# (wider than Arial -> fewer fit), so BOTH numbers must be re-measured against
-# those fonts when v3.1 lands.
+# Overlay copy should fit ONE line of the 9:16 drawtext overlay at full size.
+# These caps are WARNING thresholds only — never a hard failure. They are now
+# measured against the real v3.1 fonts at fontsize 72 vs 972px usable width
+# (1080px frame minus a 5% margin per side): Montserrat ExtraBold (close_text)
+# averages ~53.5px/char, Anton (hook_text) ~34.1px/char. Clipping itself is no
+# longer at stake — the assembler guarantees fit via dynamic fontsize shrink —
+# so these caps exist to keep overlay text rendering at FULL size, not to
+# prevent clipping.
 HOOK_TEXT_MAX_CHARS = 22
-CLOSE_TEXT_MAX_CHARS = 24
+CLOSE_TEXT_MAX_CHARS = 16
 
 
 class CreativeError(RuntimeError):

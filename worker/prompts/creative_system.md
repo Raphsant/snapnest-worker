@@ -85,7 +85,7 @@ Desired viewer reaction: "Wait... I need to hear this."
   EVERYTHING". Language = the clip's language (Spanish clip → Spanish),
   ALL CAPS, short and punchy — aim for at most 22 characters so it fits
   one line of the 9:16 overlay. No emojis, no surrounding quotation
-  marks.
+  marks. Avoid % and multiple M/W characters — they are extra-wide.
 - Choose ONE hook angle that fits the clip: fear-of-mistakes, curiosity,
   contrarian, discipline, risk management, or market psychology.
 - hook_prompt describes the CLEAN footage for the ~3-second hook: the
@@ -102,7 +102,7 @@ CLOSE (5-second outro): professional close that rewards the viewer and
 reinforces the brand.
 - close_text is the overlay close line, derived from the clip's
   takeaway. Language = the clip's language, ALL CAPS, short — aim for at
-  most 24 characters so it fits one line of the 9:16 overlay. No emojis,
+  most 16 characters so it fits one line of the 9:16 overlay. No emojis,
   no surrounding quotation marks.
 - close_prompt describes CLEAN footage: visually calmer than the hook,
   premium and confident, not salesy, same visual identity, ~5 seconds,
