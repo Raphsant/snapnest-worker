@@ -1,46 +1,49 @@
+"""Generate-stage tests for the v2 validation-only contract.
+
+No Higgsfield mock appears anywhere in this file — its absence is the test:
+the stage must pass or fail without touching worker.higgsfield at all.
+"""
+
 from __future__ import annotations
 
 import copy
+import io
+import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import Mock
 
 import pytest
 from mypy_boto3_s3.client import S3Client
 from psycopg import Connection
 from psycopg.rows import DictRow
 
-from worker import higgsfield
-from worker.higgsfield import GenerationParams, GenerationResult
 from worker.jobs import Job
 from worker.stages.generate import (
-    BRIDGE_IN_PROMPT,
-    BRIDGE_OUT_PROMPT,
     GenerateError,
     GenerateStageContext,
-    build_frame_command,
     run_generate,
 )
 from worker.workspace import Workspace
 
 JOB_ID = "job-1"
 CLIP_ID = "clip_01"
-RESULT_URL = "https://cdn.example.test/result.mp4"
+SECOND_CLIP_ID = "clip_02"
+LIBRARY_PREFIX = "library/"
+CATALOG_KEY = f"{LIBRARY_PREFIX}catalog.json"
 
 
 class FakeS3:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
         self.uploads: list[str] = []
-        self.downloads: list[str] = []
 
-    def download_file(self, bucket: str, key: str, filename: str) -> None:
-        self.downloads.append(key)
-        Path(filename).parent.mkdir(parents=True, exist_ok=True)
-        Path(filename).write_bytes(self.objects[key])
+    def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
+        if Key not in self.objects:
+            raise RuntimeError(f"NoSuchKey: {Key}")
+        return {"Body": io.BytesIO(self.objects[Key])}
 
     def upload_file(self, filename: str, bucket: str, key: str) -> None:
         self.uploads.append(key)
@@ -68,11 +71,16 @@ class FakeManifestDB:
 
 
 @dataclass
+class _FakeConfig:
+    library_prefix: str = LIBRARY_PREFIX
+
+
+@dataclass
 class FakeContext:
     job: Job
     workspace: Workspace
     conn: Connection[DictRow]
-    checkpoint_heartbeat: Callable[[], None]
+    config: _FakeConfig
 
 
 @dataclass
@@ -80,35 +88,58 @@ class Harness:
     context: FakeContext
     s3: FakeS3
     db: FakeManifestDB
-    heartbeats: list[int]
 
     def run(self) -> None:
         with self.context.workspace:
             run_generate(cast(GenerateStageContext, self.context))
 
 
-def _checkpoint(asset: str) -> dict[str, object]:
+def _asset(asset_id: str, asset_type: str) -> dict[str, Any]:
     return {
-        "s3Key": f"pipeline/{JOB_ID}/generated/{CLIP_ID}/{asset}.mp4",
-        "generationId": f"existing-{asset}",
-        "estimatedCredits": 36,
-        "completedAt": "2026-07-15T12:00:00+00:00",
+        "id": asset_id,
+        "type": asset_type,
+        "s3_key": f"library/{asset_type}s/{asset_id}.mp4",
+        "duration_s": 4.0,
+        "category": ["mindset"],
+        "tags": ["edu"],
+        "character": None,
+        "description": f"{asset_id} description",
+        "times_used": 0,
     }
 
 
-def _manifest(*, checkpointed: tuple[str, ...] = ()) -> dict[str, Any]:
-    generated = {asset: _checkpoint(asset) for asset in checkpointed}
+def _catalog_json() -> bytes:
+    return json.dumps(
+        {
+            "version": 1,
+            "updated_at": "2026-08-01T00:00:00+00:00",
+            "notes": "operator selection rules",
+            "assets": [
+                _asset("H01", "hook"),
+                _asset("H02", "hook"),
+                _asset("O01", "outro"),
+                _asset("O02", "outro"),
+            ],
+        }
+    ).encode("utf-8")
+
+
+def _clip(
+    clip_id: str = CLIP_ID, *, hook: str = "H01", outro: str = "O01"
+) -> dict[str, Any]:
+    return {
+        "id": clip_id,
+        "approved": True,
+        "category": "mindset",
+        "hook_asset_id": hook,
+        "outro_asset_id": outro,
+    }
+
+
+def _manifest(clips: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     return {
         "status": "approved",
-        "clips": [
-            {
-                "id": CLIP_ID,
-                "approved": True,
-                "hook_prompt": "hook prompt",
-                "close_prompt": "close prompt",
-                "generated": generated,
-            }
-        ],
+        "clips": [_clip()] if clips is None else clips,
     }
 
 
@@ -116,24 +147,13 @@ def _harness(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     manifest: dict[str, Any],
+    *,
+    with_catalog: bool = True,
 ) -> Harness:
     fake_s3 = FakeS3()
-    fake_s3.objects.update(
-        {
-            f"pipeline/{JOB_ID}/clips/subclips/{CLIP_ID}_first5.mp4": b"first5",
-            f"pipeline/{JOB_ID}/clips/subclips/{CLIP_ID}_last5.mp4": b"last5",
-        }
-    )
-    for asset, checkpoint in manifest["clips"][0]["generated"].items():
-        fake_s3.objects[str(checkpoint["s3Key"])] = f"{asset}-video".encode()
-
-    workspace = Workspace(
-        JOB_ID,
-        tmp_path,
-        cast(S3Client, fake_s3),
-        "bucket",
-    )
-    heartbeats: list[int] = []
+    if with_catalog:
+        fake_s3.objects[CATALOG_KEY] = _catalog_json()
+    workspace = Workspace(JOB_ID, tmp_path, cast(S3Client, fake_s3), "bucket")
     context = FakeContext(
         job=Job(
             id=JOB_ID,
@@ -148,7 +168,7 @@ def _harness(
         ),
         workspace=workspace,
         conn=cast(Connection[DictRow], object()),
-        checkpoint_heartbeat=lambda: heartbeats.append(1),
+        config=_FakeConfig(),
     )
     fake_db = FakeManifestDB(manifest)
     monkeypatch.setattr(
@@ -159,355 +179,122 @@ def _harness(
         "worker.stages.generate.jobs.load_manifest",
         fake_db.load,
     )
-
-    def fake_ffmpeg(command: list[str]) -> None:
-        Path(command[-1]).write_bytes(b"jpg")
-
-    monkeypatch.setattr("worker.stages.generate._run_ffmpeg", fake_ffmpeg)
-    return Harness(context, fake_s3, fake_db, heartbeats)
+    return Harness(context, fake_s3, fake_db)
 
 
-def _install_costs_and_balance(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    balance: int,
-) -> list[GenerationParams]:
-    cost_params: list[GenerationParams] = []
-
-    def fake_get_cost(params: GenerationParams) -> int:
-        cost_params.append(params)
-        return {4: 36, 5: 45}[params.duration_s]
-
-    monkeypatch.setattr(
-        "worker.stages.generate.higgsfield.get_cost",
-        fake_get_cost,
-    )
-    monkeypatch.setattr(
-        "worker.stages.generate.higgsfield.balance",
-        lambda: balance,
-    )
-    return cost_params
-
-
-def _install_successful_generation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> list[GenerationParams]:
-    calls: list[GenerationParams] = []
-
-    def fake_generate(
-        params: GenerationParams, output_path: Path
-    ) -> GenerationResult:
-        calls.append(params)
-        output_path.write_bytes(b"generated mp4")
-        return GenerationResult(
-            id=f"generation-{len(calls)}",
-            result_url=RESULT_URL,
-            credits_charged=None,
-            elapsed_s=1.0,
-        )
-
-    monkeypatch.setattr(
-        "worker.stages.generate.higgsfield.generate",
-        fake_generate,
-    )
-    return calls
-
-
-def test_preflight_insufficient_balance_never_generates(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    harness = _harness(monkeypatch, tmp_path, _manifest())
-    cost_params = _install_costs_and_balance(monkeypatch, balance=100)
-    generate = Mock()
-    monkeypatch.setattr(
-        "worker.stages.generate.higgsfield.generate",
-        generate,
-    )
-
-    with pytest.raises(GenerateError) as raised:
-        harness.run()
-
-    message = str(raised.value)
-    assert "balance=100" in message
-    assert "required=153" in message
-    assert "hook=36" in message
-    assert "outro=45" in message
-    assert "bridge_each=36" in message
-    assert [params.duration_s for params in cost_params] == [4, 5, 4]
-    assert cost_params[2].start_image is None
-    assert cost_params[2].end_image is None
-    generate.assert_not_called()
-    assert harness.db.checkpoints == []
-    assert harness.heartbeats == []
-
-
-def test_lint_violation_blocks_generation_before_any_higgsfield_call(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    manifest = _manifest()
-    manifest["clips"][0]["hook_prompt"] = (
-        "Push in on the STC logo, bottom-right."
-    )
-    harness = _harness(monkeypatch, tmp_path, manifest)
-
-    balance = Mock()
-    get_cost = Mock()
-    generate = Mock()
-    monkeypatch.setattr("worker.stages.generate.higgsfield.balance", balance)
-    monkeypatch.setattr("worker.stages.generate.higgsfield.get_cost", get_cost)
-    monkeypatch.setattr("worker.stages.generate.higgsfield.generate", generate)
-
-    with pytest.raises(GenerateError) as raised:
-        harness.run()
-
-    message = str(raised.value)
-    assert "lint violation" in message
-    assert f"{CLIP_ID}.hook_prompt" in message
-    assert "logo" in message.lower()
-    # Not a single Higgsfield call — not even the balance check — was made.
-    balance.assert_not_called()
-    get_cost.assert_not_called()
-    generate.assert_not_called()
-    assert harness.db.checkpoints == []
-    assert harness.heartbeats == []
-
-
-def test_negated_lint_warning_does_not_block_generation(
+def test_valid_selections_pass_log_resolved_keys_and_advance(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # A negated branding word ("no logos") is a non-blocking WARNING — unlike a
-    # naked one, it must NOT stop generation.
-    manifest = _manifest()
-    manifest["clips"][0]["hook_prompt"] = (
-        "Clean trading desk, no logos, plain background."
-    )
-    harness = _harness(monkeypatch, tmp_path, manifest)
-    _install_costs_and_balance(monkeypatch, balance=1000)
-    generation_calls = _install_successful_generation(monkeypatch)
+    harness = _harness(monkeypatch, tmp_path, _manifest())
 
     with caplog.at_level(logging.INFO):
-        harness.run()  # must NOT raise a lint GenerateError
-
-    # It got past the lint gate into real generation, and logged the warning.
-    assert generation_calls
-    assert "negated lint warning" in caplog.text
-
-
-def test_resume_skips_checkpointed_hook(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    harness = _harness(
-        monkeypatch,
-        tmp_path,
-        _manifest(checkpointed=("hook",)),
-    )
-    _install_costs_and_balance(monkeypatch, balance=1000)
-    generation_calls = _install_successful_generation(monkeypatch)
-
-    harness.run()
-
-    assert [params.prompt for params in generation_calls] == [
-        "close prompt",
-        BRIDGE_IN_PROMPT,
-        BRIDGE_OUT_PROMPT,
-    ]
-    assert len(harness.db.checkpoints) == 3
-    assert len(harness.heartbeats) == 3
-    assert (
-        f"pipeline/{JOB_ID}/generated/{CLIP_ID}/hook.mp4"
-        in harness.s3.downloads
-    )
-
-
-def test_download_error_retries_download_without_regenerating(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    harness = _harness(
-        monkeypatch,
-        tmp_path,
-        _manifest(checkpointed=("outro", "bridge_in", "bridge_out")),
-    )
-    _install_costs_and_balance(monkeypatch, balance=1000)
-    generation_calls: list[GenerationParams] = []
-    download_calls: list[tuple[str, Path]] = []
-
-    def failed_download_generation(
-        params: GenerationParams, output_path: Path
-    ) -> GenerationResult:
-        generation_calls.append(params)
-        raise higgsfield.HiggsfieldDownloadError(
-            "remote generation completed",
-            generation_id="spent-generation",
-            result_url=RESULT_URL,
-        )
-
-    def fake_download(result_url: str, output_path: Path) -> None:
-        download_calls.append((result_url, output_path))
-        output_path.write_bytes(b"recovered mp4")
-
-    monkeypatch.setattr(
-        "worker.stages.generate.higgsfield.generate",
-        failed_download_generation,
-    )
-    monkeypatch.setattr(
-        "worker.stages.generate.higgsfield.download",
-        fake_download,
-    )
-
-    harness.run()
-
-    assert len(generation_calls) == 1
-    assert len(download_calls) == 1
-    assert download_calls[0][0] == RESULT_URL
-    hook = harness.db.manifest["clips"][0]["generated"]["hook"]
-    assert hook["generationId"] == "spent-generation"
-
-
-def test_mid_package_failure_preserves_prior_checkpoint(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    harness = _harness(monkeypatch, tmp_path, _manifest())
-    _install_costs_and_balance(monkeypatch, balance=1000)
-    calls: list[str] = []
-
-    def fail_outro(
-        params: GenerationParams, output_path: Path
-    ) -> GenerationResult:
-        calls.append(output_path.name)
-        if output_path.name == "hook.mp4":
-            output_path.write_bytes(b"hook")
-            return GenerationResult(
-                id="hook-generation",
-                result_url=RESULT_URL,
-                credits_charged=None,
-                elapsed_s=1.0,
-            )
-        raise higgsfield.HiggsfieldError(
-            "generation rejected",
-            command=("higgsfield",),
-            exit_code=3,
-        )
-
-    monkeypatch.setattr(
-        "worker.stages.generate.higgsfield.generate",
-        fail_outro,
-    )
-
-    with pytest.raises(GenerateError) as raised:
         harness.run()
 
-    assert CLIP_ID in str(raised.value)
-    assert "outro" in str(raised.value)
-    assert calls == ["hook.mp4", "outro.mp4", "outro.mp4"]
-    generated = harness.db.manifest["clips"][0]["generated"]
-    assert set(generated) == {"hook"}
-    assert generated["hook"]["generationId"] == "hook-generation"
-    assert len(harness.db.checkpoints) == 1
-    assert harness.heartbeats == [1]
-
-
-def test_ambiguous_submit_is_not_retried_and_preserves_raw_stdout(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    harness = _harness(
-        monkeypatch,
-        tmp_path,
-        _manifest(checkpointed=("outro", "bridge_in", "bridge_out")),
-    )
-    _install_costs_and_balance(monkeypatch, balance=1000)
-    raw_stdout = '["possible-orphan-id", "unexpected-second-value"]'
-    generate_calls: list[GenerationParams] = []
-
-    def ambiguous_submit(
-        params: GenerationParams, output_path: Path
-    ) -> GenerationResult:
-        generate_calls.append(params)
-        raise higgsfield.HiggsfieldAmbiguousSubmitError(
-            command=("higgsfield", "generate", "create"),
-            raw_stdout=raw_stdout,
-        )
-
-    monkeypatch.setattr(
-        "worker.stages.generate.higgsfield.generate",
-        ambiguous_submit,
-    )
-
-    with pytest.raises(GenerateError) as raised:
-        harness.run()
-
-    assert len(generate_calls) == 1
-    assert raw_stdout in str(raised.value)
-    assert "NOT retrying" in str(raised.value)
+    # Success path: only the final manifest sync touches S3; no checkpoints.
+    assert harness.s3.uploads == [f"pipeline/{JOB_ID}/manifest.json"]
     assert harness.db.checkpoints == []
-    assert harness.heartbeats == []
+    assert f"clip={CLIP_ID}" in caplog.text
+    assert "hook_asset=H01" in caplog.text
+    assert "library/hooks/H01.mp4" in caplog.text
+    assert "outro_asset=O01" in caplog.text
+    assert "library/outros/O01.mp4" in caplog.text
 
 
-def test_success_checkpoints_each_asset_and_heartbeats_each_time(
+def test_rerun_on_already_valid_manifest_is_idempotent(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     harness = _harness(monkeypatch, tmp_path, _manifest())
-    cost_params = _install_costs_and_balance(monkeypatch, balance=1000)
-    generation_calls = _install_successful_generation(monkeypatch)
 
     harness.run()
+    harness.run()
 
-    assert [path for path in harness.s3.uploads if path.endswith(".mp4")] == [
-        f"pipeline/{JOB_ID}/generated/{CLIP_ID}/hook.mp4",
-        f"pipeline/{JOB_ID}/generated/{CLIP_ID}/outro.mp4",
-        f"pipeline/{JOB_ID}/generated/{CLIP_ID}/bridge_in.mp4",
-        f"pipeline/{JOB_ID}/generated/{CLIP_ID}/bridge_out.mp4",
-    ]
-    assert harness.s3.uploads[-1] == f"pipeline/{JOB_ID}/manifest.json"
-    assert len(harness.db.checkpoints) == 4
-    assert harness.heartbeats == [1, 1, 1, 1]
-    assert [params.duration_s for params in generation_calls] == [4, 5, 4, 4]
-    assert all(params.model == "seedance_2_0" for params in generation_calls)
-    assert all(params.aspect_ratio == "9:16" for params in generation_calls)
-    assert all(params.resolution == "1080p" for params in generation_calls)
-    assert all(params.generate_audio is False for params in generation_calls)
-    assert generation_calls[1].start_image is None
-    assert generation_calls[1].end_image is None
-    assert generation_calls[2].start_image is not None
-    assert generation_calls[2].end_image is not None
-    assert generation_calls[3].start_image is not None
-    assert generation_calls[3].end_image is not None
-    assert [params.duration_s for params in cost_params] == [4, 5, 4]
+    assert harness.s3.uploads == [f"pipeline/{JOB_ID}/manifest.json"] * 2
+    assert harness.db.checkpoints == []
 
 
-def test_frame_commands_match_first_and_last_frame_recipes(tmp_path: Path) -> None:
-    source = tmp_path / "source.mp4"
-    output = tmp_path / "frame.jpg"
+def test_missing_asset_id_field_fails_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest()
+    del manifest["clips"][0]["outro_asset_id"]
+    harness = _harness(monkeypatch, tmp_path, manifest)
 
-    assert build_frame_command(source, output, last=False) == [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(source),
-        "-frames:v",
-        "1",
-        "-q:v",
-        "2",
-        str(output),
-    ]
-    assert build_frame_command(source, output, last=True) == [
-        "ffmpeg",
-        "-y",
-        "-sseof",
-        "-0.1",
-        "-i",
-        str(source),
-        "-frames:v",
-        "1",
-        "-q:v",
-        "2",
-        str(output),
-    ]
+    with pytest.raises(GenerateError) as raised:
+        harness.run()
+
+    assert "clips[0].outro_asset_id" in str(raised.value)
+    assert harness.s3.uploads == []
+
+
+def test_unknown_asset_id_hard_fails_naming_the_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = _harness(monkeypatch, tmp_path, _manifest([_clip(hook="H99")]))
+
+    with pytest.raises(GenerateError) as raised:
+        harness.run()
+
+    message = str(raised.value)
+    assert "library-selection lint violation" in message
+    assert f"{CLIP_ID}.hook_asset_id" in message
+    assert "'H99'" in message
+    assert harness.s3.uploads == []
+
+
+def test_duplicate_selection_across_clips_hard_fails_naming_both(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(
+        [
+            _clip(),
+            _clip(SECOND_CLIP_ID, hook="H01", outro="O02"),
+        ]
+    )
+    harness = _harness(monkeypatch, tmp_path, manifest)
+
+    with pytest.raises(GenerateError) as raised:
+        harness.run()
+
+    message = str(raised.value)
+    assert "'H01'" in message
+    assert CLIP_ID in message
+    assert SECOND_CLIP_ID in message
+    assert harness.s3.uploads == []
+
+
+def test_missing_catalog_fails_the_stage_clearly(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = _harness(monkeypatch, tmp_path, _manifest(), with_catalog=False)
+
+    with pytest.raises(GenerateError) as raised:
+        harness.run()
+
+    assert "library catalog unavailable or invalid" in str(raised.value)
+    assert harness.s3.uploads == []
+
+
+def test_stale_prompt_field_with_branding_hard_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Pre-v2 manifests carried generation prompts; a surviving one that embeds
+    # branding must still hard-fail via the legacy prompt lint.
+    manifest = _manifest()
+    manifest["clips"][0]["hook_prompt"] = "Push in on the STC logo, bottom-right."
+    harness = _harness(monkeypatch, tmp_path, manifest)
+
+    with pytest.raises(GenerateError) as raised:
+        harness.run()
+
+    message = str(raised.value)
+    assert "generation-prompt lint" in message
+    assert f"{CLIP_ID}.hook_prompt" in message
+    assert harness.s3.uploads == []
