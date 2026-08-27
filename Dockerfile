@@ -21,14 +21,16 @@ ENV PYTHONUNBUFFERED=1 \
 # ffmpeg MUST be a libass build (captions burn via the `subtitles` filter) with
 # libfreetype (`drawtext` overlays); fontconfig lets libass load the bundled
 # faces via the subtitles filter's fontsdir= option. curl + ca-certificates
-# fetch the pinned Higgsfield CLI below. The build FAILS HERE if this ffmpeg is
-# missing either filter, rather than failing at run time on a paid job.
+# fetch the pinned Higgsfield CLI and Deno below; unzip unpacks the Deno
+# release archive. The build FAILS HERE if this ffmpeg is missing either
+# filter, rather than failing at run time on a paid job.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ffmpeg \
         fontconfig \
         curl \
         ca-certificates \
+        unzip \
  && rm -rf /var/lib/apt/lists/* \
  && { ffmpeg -hide_banner -filters | grep -qw subtitles \
         || { echo "FATAL: ffmpeg lacks the 'subtitles' filter (libass missing)"; exit 1; }; } \
@@ -54,6 +56,23 @@ RUN curl -fsSL -o /tmp/hf.tar.gz \
  && ln -s /usr/local/bin/hf /usr/local/bin/higgsfield \
  && rm /tmp/hf.tar.gz \
  && higgsfield --version
+
+# --- Deno (JS runtime for yt-dlp YouTube extraction) ----------------------
+# yt-dlp now requires a JavaScript runtime (deno is its default) to solve
+# YouTube's player challenges; without one the download stage fails with
+# "No supported JavaScript runtime could be found" + HTTP 403. Pinned and
+# sha256-verified against the release .sha256sum, same policy as the
+# Higgsfield CLI above.
+#   x86_64-unknown-linux-gnu sha256: 8b010a3b1a4a0188a67cdb8a7a27348b2a501af78aec7fc74f2ace167368d530
+ARG DENO_VERSION=2.9.5
+ARG DENO_SHA256=8b010a3b1a4a0188a67cdb8a7a27348b2a501af78aec7fc74f2ace167368d530
+RUN curl -fsSL -o /tmp/deno.zip \
+      "https://github.com/denoland/deno/releases/download/v${DENO_VERSION}/deno-x86_64-unknown-linux-gnu.zip" \
+ && echo "${DENO_SHA256}  /tmp/deno.zip" | sha256sum -c - \
+ && unzip -q /tmp/deno.zip deno -d /usr/local/bin \
+ && chmod 0755 /usr/local/bin/deno \
+ && rm /tmp/deno.zip \
+ && deno --version
 
 # --- Python dependencies via uv (reproducible, from uv.lock) --------------
 # Pin uv to the version that produced uv.lock.

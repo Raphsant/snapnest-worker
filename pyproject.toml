@@ -13,7 +13,7 @@ dependencies = [
   "fonttools>=4.50",
   "psycopg[binary]>=3.1",
   "python-dotenv>=1.0",
-  "yt-dlp==2026.7.4",
+  "yt-dlp==2026.8.19",
 ]
 
 [project.optional-dependencies]
