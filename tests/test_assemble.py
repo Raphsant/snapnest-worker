@@ -705,10 +705,14 @@ def test_final_command_xfade_math_from_probed_durations(
         "[vx][v2]xfade=transition=fade:duration=0.5:offset=138.490000[video]"
         in graph
     )
-    # Voice starts at the hook->main crossfade: (4.04 - 0.25) * 1000 ms.
-    assert "[1:a]adelay=3790|3790,apad[voice]" in graph
-    # Bed and end fade are unchanged from the concat era.
-    assert "volume=0.02[bed]" in graph
+    # Voice starts at the hook->main crossfade: (4.04 - 0.25) * 1000 ms,
+    # and the pad stops at the final total so amix reaches EOF.
+    assert "[1:a]adelay=3790|3790,apad=whole_dur=143.530000[voice]" in graph
+    # Every apad must be bounded — a bare apad is an infinite stream that
+    # makes amix(duration=first) buffer the looped bed without bound.
+    assert "apad[" not in graph
+    # Bed is trimmed in-graph to bound the -stream_loop -1 input.
+    assert "volume=0.02,atrim=duration=143.530000[bed]" in graph
     assert "areverse,afade=t=in:d=1.5,areverse" in graph
     # -t clamps to hook + main + outro - 0.75.
     assert final[final.index("-t") + 1] == "143.530000"
@@ -1315,9 +1319,9 @@ def test_final_command_argv(tmp_path: Path) -> None:
         "[2:v]settb=AVTB[v2];"
         "[v0][v1]xfade=transition=fade:duration=0.25:offset=3.790000[vx];"
         "[vx][v2]xfade=transition=fade:duration=0.5:offset=138.490000[video];"
-        "[1:a]adelay=3790|3790,apad[voice];"
+        "[1:a]adelay=3790|3790,apad=whole_dur=143.530000[voice];"
         "[3:a]aformat=sample_rates=48000:channel_layouts=stereo,"
-        "volume=0.02[bed];"
+        "volume=0.02,atrim=duration=143.530000[bed];"
         "[voice][bed]amix=inputs=2:duration=first:normalize=0:"
         "dropout_transition=0,areverse,afade=t=in:d=1.5,"
         "areverse,asetpts=N/SR/TB[audio]"

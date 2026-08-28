@@ -805,9 +805,12 @@ def build_final_command(
 
     Offsets come from the ffprobe'd durations of the normalized segment FILES
     (never catalog duration_s). Main's voice is delayed to the start of the
-    hook->main crossfade and apad'ed; amix(duration=first) over the padded
-    voice runs long, so the output is clamped with -t to the exact total:
-    hook + main + outro - both xfade overlaps.
+    hook->main crossfade and apad'ed to exactly the final total
+    (apad=whole_dur); the looped bed is atrim'ed to the same total. Both
+    mix inputs therefore reach EOF inside the graph — an unbounded apad
+    would keep amix(duration=first) from ever ending and let the
+    -stream_loop bed buffer without bound. -t remains as an output clamp
+    to the exact total: hook + main + outro - both xfade overlaps.
     """
 
     fade_hook_main = CONFIG["xfade_hook_main_s"]
@@ -834,10 +837,12 @@ def build_final_command(
         f"offset={offset_hook_main:.6f}[vx]",
         f"[vx][v2]xfade=transition=fade:duration={fade_main_outro}:"
         f"offset={offset_main_outro:.6f}[video]",
-        f"[1:a]adelay={voice_delay_ms}|{voice_delay_ms},apad[voice]",
+        f"[1:a]adelay={voice_delay_ms}|{voice_delay_ms},"
+        f"apad=whole_dur={total_s:.6f}[voice]",
         f"[3:a]aformat=sample_rates={CONFIG['audio_sample_rate']}:"
         f"channel_layouts={CONFIG['audio_layout']},"
-        f"volume={CONFIG['bed_volume']}[bed]",
+        f"volume={CONFIG['bed_volume']},"
+        f"atrim=duration={total_s:.6f}[bed]",
         "[voice][bed]amix=inputs=2:duration=first:normalize=0:"
         "dropout_transition=0,"
         "areverse,"
