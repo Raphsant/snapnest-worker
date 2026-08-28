@@ -790,27 +790,44 @@ def build_duration_probe_command(source: Path) -> list[str]:
     ]
 
 
-def build_final_command(
+def _final_total_s(
+    hook_duration_s: float,
+    main_duration_s: float,
+    outro_duration_s: float,
+) -> float:
+    """Final runtime: the three segments minus both crossfade overlaps.
+
+    Both passes derive their clamps from this one formula — a drift between
+    pass 1's -t and pass 2's apad/atrim would desync voice from picture.
+    """
+
+    return (
+        hook_duration_s
+        + main_duration_s
+        + outro_duration_s
+        - CONFIG["xfade_hook_main_s"]
+        - CONFIG["xfade_main_outro_s"]
+    )
+
+
+def build_video_xfade_command(
     hook: Path,
     main: Path,
     outro: Path,
-    bed_music: Path,
     output: Path,
     *,
     hook_duration_s: float,
     main_duration_s: float,
     outro_duration_s: float,
 ) -> list[str]:
-    """Build the hook->main->outro xfade chain plus the delayed-voice bed mix.
+    """Pass 1 of 2: the hook->main->outro video crossfade chain, no audio.
 
     Offsets come from the ffprobe'd durations of the normalized segment FILES
-    (never catalog duration_s). Main's voice is delayed to the start of the
-    hook->main crossfade and apad'ed to exactly the final total
-    (apad=whole_dur); the looped bed is atrim'ed to the same total. Both
-    mix inputs therefore reach EOF inside the graph — an unbounded apad
-    would keep amix(duration=first) from ever ending and let the
-    -stream_loop bed buffer without bound. -t remains as an output clamp
-    to the exact total: hook + main + outro - both xfade overlaps.
+    (never catalog duration_s). Splitting video from the audio mix halves
+    peak RSS: a single graph holding 3 video decoders + 2 chained xfades +
+    x264 + the mix was kernel-killed at ~16GB. -threads is pinned because
+    x264's auto thread count inflates per-thread frame buffers with no
+    throughput gain on a 1080x1920 chain this short.
     """
 
     fade_hook_main = CONFIG["xfade_hook_main_s"]
@@ -819,14 +836,9 @@ def build_final_command(
     offset_main_outro = (
         hook_duration_s + main_duration_s - fade_hook_main - fade_main_outro
     )
-    total_s = (
-        hook_duration_s
-        + main_duration_s
-        + outro_duration_s
-        - fade_hook_main
-        - fade_main_outro
+    total_s = _final_total_s(
+        hook_duration_s, main_duration_s, outro_duration_s
     )
-    voice_delay_ms = round(offset_hook_main * 1000)
 
     filters = [
         # settb=AVTB on EVERY xfade input: xfade rejects mismatched timebases.
@@ -837,9 +849,67 @@ def build_final_command(
         f"offset={offset_hook_main:.6f}[vx]",
         f"[vx][v2]xfade=transition=fade:duration={fade_main_outro}:"
         f"offset={offset_main_outro:.6f}[video]",
+    ]
+    return [
+        CONFIG["ffmpeg_binary"],
+        "-y",
+        "-i",
+        str(hook),
+        "-i",
+        str(main),
+        "-i",
+        str(outro),
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        "[video]",
+        "-an",
+        "-t",
+        f"{total_s:.6f}",
+        "-c:v",
+        CONFIG["video_codec"],
+        "-pix_fmt",
+        CONFIG["pixel_format"],
+        "-r",
+        str(CONFIG["output_fps"]),
+        "-threads",
+        "8",
+        str(output),
+    ]
+
+
+def build_audio_mux_command(
+    video: Path,
+    main: Path,
+    bed_music: Path,
+    output: Path,
+    *,
+    hook_duration_s: float,
+    main_duration_s: float,
+    outro_duration_s: float,
+) -> list[str]:
+    """Pass 2 of 2: mix main's delayed voice with the bed onto pass 1's video.
+
+    Pass 1's picture is stream-copied, so this pass decodes no video at all.
+    Main's voice is delayed to the start of the hook->main crossfade and
+    apad'ed to exactly the final total (apad=whole_dur); the looped bed is
+    atrim'ed to the same total. Both mix inputs therefore reach EOF inside
+    the graph — an unbounded apad would keep amix(duration=first) from ever
+    ending and let the -stream_loop bed buffer without bound. -t remains as
+    an output clamp.
+    """
+
+    total_s = _final_total_s(
+        hook_duration_s, main_duration_s, outro_duration_s
+    )
+    voice_delay_ms = round(
+        (hook_duration_s - CONFIG["xfade_hook_main_s"]) * 1000
+    )
+
+    filters = [
         f"[1:a]adelay={voice_delay_ms}|{voice_delay_ms},"
         f"apad=whole_dur={total_s:.6f}[voice]",
-        f"[3:a]aformat=sample_rates={CONFIG['audio_sample_rate']}:"
+        f"[2:a]aformat=sample_rates={CONFIG['audio_sample_rate']}:"
         f"channel_layouts={CONFIG['audio_layout']},"
         f"volume={CONFIG['bed_volume']},"
         f"atrim=duration={total_s:.6f}[bed]",
@@ -853,11 +923,9 @@ def build_final_command(
         CONFIG["ffmpeg_binary"],
         "-y",
         "-i",
-        str(hook),
+        str(video),
         "-i",
         str(main),
-        "-i",
-        str(outro),
         "-stream_loop",
         "-1",
         "-i",
@@ -865,17 +933,13 @@ def build_final_command(
         "-filter_complex",
         ";".join(filters),
         "-map",
-        "[video]",
+        "0:v",
         "-map",
         "[audio]",
         "-t",
         f"{total_s:.6f}",
         "-c:v",
-        CONFIG["video_codec"],
-        "-pix_fmt",
-        CONFIG["pixel_format"],
-        "-r",
-        str(CONFIG["output_fps"]),
+        "copy",
         "-c:a",
         CONFIG["audio_codec"],
         "-movflags",
@@ -1062,19 +1126,35 @@ def _process_clip(
             outro_normalized, description=f"clip {clip.clip_id} segment outro"
         )
 
-        final_path = directory / f"final_{clip.clip_id}_9x16.mp4"
+        # Two passes: one graph with 3 video decoders + 2 xfades + x264 +
+        # the audio mix peaked at ~16GB RSS and was kernel-killed. Video
+        # first (no audio), then a stream-copy mux of the audio mix.
+        xfaded_video = directory / "video_xfaded.mp4"
         _run_ffmpeg(
-            build_final_command(
+            build_video_xfade_command(
                 hook_normalized,
                 trimmed_main,
                 outro_normalized,
+                xfaded_video,
+                hook_duration_s=hook_duration,
+                main_duration_s=main_duration,
+                outro_duration_s=outro_duration,
+            ),
+            description=f"clip {clip.clip_id} final video xfade pass",
+        )
+
+        final_path = directory / f"final_{clip.clip_id}_9x16.mp4"
+        _run_ffmpeg(
+            build_audio_mux_command(
+                xfaded_video,
+                trimmed_main,
                 bed_music,
                 final_path,
                 hook_duration_s=hook_duration,
                 main_duration_s=main_duration,
                 outro_duration_s=outro_duration,
             ),
-            description=f"clip {clip.clip_id} final xfade and audio mix",
+            description=f"clip {clip.clip_id} final audio mix and mux",
         )
 
         output_key = (

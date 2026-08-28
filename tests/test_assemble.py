@@ -25,13 +25,14 @@ from worker.stages.assemble import (
     CONFIG,
     SilenceInterval,
     TextOverlay,
+    build_audio_mux_command,
     build_clip_srt,
     build_duration_probe_command,
-    build_final_command,
     build_library_segment_command,
     build_main_caption_command,
     build_silence_cut_command,
     build_silence_detect_command,
+    build_video_xfade_command,
     parse_master_srt,
     run_assemble,
 )
@@ -668,14 +669,15 @@ def test_success_uploads_and_checkpoints_once_per_clip(
     assert checkpoint["s3Key"] == final_key
     assert isinstance(checkpoint["completedAt"], str)
     assert harness.heartbeats == [1]
-    assert len(harness.ffmpeg_commands) == 6
+    assert len(harness.ffmpeg_commands) == 7
     assert harness.ffmpeg_descriptions == [
         f"clip {CLIP_ID} asset hook normalization",
         f"clip {CLIP_ID} asset outro normalization",
         f"clip {CLIP_ID} main caption burn",
         f"clip {CLIP_ID} silence detection",
         f"clip {CLIP_ID} silence removal",
-        f"clip {CLIP_ID} final xfade and audio mix",
+        f"clip {CLIP_ID} final video xfade pass",
+        f"clip {CLIP_ID} final audio mix and mux",
     ]
     # Durations for offsets come from the normalized files, in order.
     assert harness.probed_segments == [
@@ -686,7 +688,7 @@ def test_success_uploads_and_checkpoints_once_per_clip(
     assert not harness.context.workspace.dir.exists()
 
 
-def test_final_command_xfade_math_from_probed_durations(
+def test_video_pass_xfade_math_from_probed_durations(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -694,8 +696,8 @@ def test_final_command_xfade_math_from_probed_durations(
 
     harness.run()
 
-    final = harness.command_for("final xfade and audio mix")
-    graph = final[final.index("-filter_complex") + 1]
+    video_pass = harness.command_for("final video xfade pass")
+    graph = video_pass[video_pass.index("-filter_complex") + 1]
     # offset1 = 4.04 - 0.25; offset2 = 4.04 + 135.2 - 0.75
     assert (
         "[v0][v1]xfade=transition=fade:duration=0.25:offset=3.790000[vx]"
@@ -705,6 +707,36 @@ def test_final_command_xfade_math_from_probed_durations(
         "[vx][v2]xfade=transition=fade:duration=0.5:offset=138.490000[video]"
         in graph
     )
+    # Pass 1 carries no audio at all: the mix is what pass 2 is for.
+    assert "-an" in video_pass
+    for audio_filter in ("adelay", "apad", "amix", "atrim", "aformat", "afade"):
+        assert audio_filter not in graph
+    # x264 auto-threading inflates per-thread frame buffers for no gain.
+    assert video_pass[video_pass.index("-threads") + 1] == "8"
+    # -t clamps to hook + main + outro - 0.75.
+    assert video_pass[video_pass.index("-t") + 1] == "143.530000"
+    inputs = [
+        Path(video_pass[index + 1]).name
+        for index, argument in enumerate(video_pass)
+        if argument == "-i"
+    ]
+    assert inputs == [
+        "hook_normalized.mp4",
+        "main_trimmed.mp4",
+        "outro_normalized.mp4",
+    ]
+
+
+def test_audio_pass_binds_voice_and_bed_and_copies_video(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = _harness(monkeypatch, tmp_path, _manifest())
+
+    harness.run()
+
+    audio_pass = harness.command_for("final audio mix and mux")
+    graph = audio_pass[audio_pass.index("-filter_complex") + 1]
     # Voice starts at the hook->main crossfade: (4.04 - 0.25) * 1000 ms,
     # and the pad stops at the final total so amix reaches EOF.
     assert "[1:a]adelay=3790|3790,apad=whole_dur=143.530000[voice]" in graph
@@ -714,17 +746,19 @@ def test_final_command_xfade_math_from_probed_durations(
     # Bed is trimmed in-graph to bound the -stream_loop -1 input.
     assert "volume=0.02,atrim=duration=143.530000[bed]" in graph
     assert "areverse,afade=t=in:d=1.5,areverse" in graph
+    # Pass 1's picture is copied: no video decode, no second encode.
+    assert audio_pass[audio_pass.index("-c:v") + 1] == "copy"
+    assert "xfade" not in graph
     # -t clamps to hook + main + outro - 0.75.
-    assert final[final.index("-t") + 1] == "143.530000"
+    assert audio_pass[audio_pass.index("-t") + 1] == "143.530000"
     inputs = [
-        Path(final[index + 1]).name
-        for index, argument in enumerate(final)
+        Path(audio_pass[index + 1]).name
+        for index, argument in enumerate(audio_pass)
         if argument == "-i"
     ]
     assert inputs == [
-        "hook_normalized.mp4",
+        "video_xfaded.mp4",
         "main_trimmed.mp4",
-        "outro_normalized.mp4",
         "bed_music.mp3",
     ]
 
@@ -737,8 +771,8 @@ def test_settb_on_every_xfade_input(
 
     harness.run()
 
-    # In the final graph, each xfade input is timebase-normalized explicitly.
-    final = harness.command_for("final xfade and audio mix")
+    # In the video pass graph, each xfade input is timebase-normalized.
+    final = harness.command_for("final video xfade pass")
     graph = final[final.index("-filter_complex") + 1]
     for chain in ("[0:v]settb=AVTB[v0]", "[1:v]settb=AVTB[v1]", "[2:v]settb=AVTB[v2]"):
         assert chain in graph
@@ -767,7 +801,7 @@ def test_no_video_fades_anywhere(
         for argument in command:
             assert not VIDEO_FADE_RE.search(argument), argument
     # Sanity: the joins really are crossfades.
-    final = harness.command_for("final xfade and audio mix")
+    final = harness.command_for("final video xfade pass")
     graph = final[final.index("-filter_complex") + 1]
     assert graph.count("xfade=transition=fade") == 2
 
@@ -787,7 +821,7 @@ def test_library_assets_download_once_per_job(
     assert harness.s3.downloads.count(LIBRARY_KEYS["O01"]) == 1
     assert f"pipeline/{JOB_ID}/clips/clip_04.mp4" in harness.s3.downloads
     assert f"pipeline/{JOB_ID}/clips/clip_05.mp4" in harness.s3.downloads
-    assert len(harness.ffmpeg_commands) == 12
+    assert len(harness.ffmpeg_commands) == 14
     assert len(harness.db.checkpoints) == 2
     assert harness.s3.uploads == [
         f"pipeline/{JOB_ID}/final/final_clip_04_9x16.mp4",
@@ -825,7 +859,8 @@ def test_success_burns_overlays_only_where_text_exists(
         "main caption burn",
         "silence detection",
         "silence removal",
-        "final xfade and audio mix",
+        "final video xfade pass",
+        "final audio mix and mux",
     ):
         command = harness.command_for(description)
         assert not any("drawtext" in argument for argument in command)
@@ -1306,31 +1341,23 @@ def test_all_three_segments_are_normalized_for_xfade(tmp_path: Path) -> None:
         assert "settb=AVTB" in command[filter_index]
 
 
-def test_final_command_argv(tmp_path: Path) -> None:
+def test_video_xfade_command_argv(tmp_path: Path) -> None:
     hook = tmp_path / "hook_normalized.mp4"
     main = tmp_path / "main_trimmed.mp4"
     outro = tmp_path / "outro_normalized.mp4"
-    bed = tmp_path / "bed.mp3"
-    output = tmp_path / "final.mp4"
+    output = tmp_path / "video_xfaded.mp4"
 
     expected_filter = (
         "[0:v]settb=AVTB[v0];"
         "[1:v]settb=AVTB[v1];"
         "[2:v]settb=AVTB[v2];"
         "[v0][v1]xfade=transition=fade:duration=0.25:offset=3.790000[vx];"
-        "[vx][v2]xfade=transition=fade:duration=0.5:offset=138.490000[video];"
-        "[1:a]adelay=3790|3790,apad=whole_dur=143.530000[voice];"
-        "[3:a]aformat=sample_rates=48000:channel_layouts=stereo,"
-        "volume=0.02,atrim=duration=143.530000[bed];"
-        "[voice][bed]amix=inputs=2:duration=first:normalize=0:"
-        "dropout_transition=0,areverse,afade=t=in:d=1.5,"
-        "areverse,asetpts=N/SR/TB[audio]"
+        "[vx][v2]xfade=transition=fade:duration=0.5:offset=138.490000[video]"
     )
-    assert build_final_command(
+    assert build_video_xfade_command(
         hook,
         main,
         outro,
-        bed,
         output,
         hook_duration_s=HOOK_DUR,
         main_duration_s=MAIN_DUR,
@@ -1344,16 +1371,11 @@ def test_final_command_argv(tmp_path: Path) -> None:
         str(main),
         "-i",
         str(outro),
-        "-stream_loop",
-        "-1",
-        "-i",
-        str(bed),
         "-filter_complex",
         expected_filter,
         "-map",
         "[video]",
-        "-map",
-        "[audio]",
+        "-an",
         "-t",
         "143.530000",
         "-c:v",
@@ -1362,6 +1384,55 @@ def test_final_command_argv(tmp_path: Path) -> None:
         "yuv420p",
         "-r",
         "30",
+        "-threads",
+        "8",
+        str(output),
+    ]
+
+
+def test_audio_mux_command_argv(tmp_path: Path) -> None:
+    video = tmp_path / "video_xfaded.mp4"
+    main = tmp_path / "main_trimmed.mp4"
+    bed = tmp_path / "bed.mp3"
+    output = tmp_path / "final.mp4"
+
+    expected_filter = (
+        "[1:a]adelay=3790|3790,apad=whole_dur=143.530000[voice];"
+        "[2:a]aformat=sample_rates=48000:channel_layouts=stereo,"
+        "volume=0.02,atrim=duration=143.530000[bed];"
+        "[voice][bed]amix=inputs=2:duration=first:normalize=0:"
+        "dropout_transition=0,areverse,afade=t=in:d=1.5,"
+        "areverse,asetpts=N/SR/TB[audio]"
+    )
+    assert build_audio_mux_command(
+        video,
+        main,
+        bed,
+        output,
+        hook_duration_s=HOOK_DUR,
+        main_duration_s=MAIN_DUR,
+        outro_duration_s=OUTRO_DUR,
+    ) == [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video),
+        "-i",
+        str(main),
+        "-stream_loop",
+        "-1",
+        "-i",
+        str(bed),
+        "-filter_complex",
+        expected_filter,
+        "-map",
+        "0:v",
+        "-map",
+        "[audio]",
+        "-t",
+        "143.530000",
+        "-c:v",
+        "copy",
         "-c:a",
         "aac",
         "-movflags",
