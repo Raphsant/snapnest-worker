@@ -35,6 +35,24 @@ REQUIRED_RESPONSE_FIELDS: tuple[str, ...] = (
     "compliance_check",
 )
 
+# The per-clip manifest fields this stage writes (see compose_manifest_fields).
+# A clip carrying all five is DONE and must not be re-processed: an extension
+# run re-enters this stage with earlier passes' clips still approved. The list
+# deliberately mirrors the backend's REQUIRED_CREATIVE_FIELDS gate
+# (approveCreative), so a clip this stage skips is exactly a clip the creative
+# gate accepts — a partially written clip is re-processed rather than left to
+# deadlock the gate at 409.
+DONE_FIELDS: tuple[str, ...] = (
+    "hook_asset_id",
+    "outro_asset_id",
+    "hook_text",
+    "close_text",
+    "post_copy",
+)
+
+# Library selection fields harvested from the manifest to seed used_ids.
+SELECTION_ID_FIELDS: tuple[str, ...] = ("hook_asset_id", "outro_asset_id")
+
 # Overlay copy should fit ONE line of the 9:16 drawtext overlay at full size.
 # These caps are WARNING thresholds only — never a hard failure. They are now
 # measured against the real v3.1 fonts at fontsize 72 vs 972px usable width
@@ -60,9 +78,21 @@ def run_creative(ctx: StageContext) -> None:
     client = _anthropic_client(ctx.config)
 
     generated: list[tuple[dict[str, Any], dict[str, str]]] = []
-    used_ids: set[str] = set()
+    # Seeded from EVERY clip in the manifest, not just the ones processed
+    # below: on an extension run the ids an earlier pass already shipped must
+    # stay off the table. lint_selections would catch such a collision at the
+    # generate stage, but only among still-approved clips and only after the
+    # model spend, so this is the real guard.
+    used_ids: set[str] = _seed_used_ids(manifest)
     for clip in approved_clips:
         clip_id = _required_clip_string(clip, "id")
+        if _clip_is_done(clip):
+            logger.info(
+                "creative[%s]: clip=%s creative fields exist; skipping",
+                ctx.job.id,
+                clip_id,
+            )
+            continue
         category = _required_clip_string(clip, "category")
         transcript = _required_clip_string(clip, "transcript")
 
@@ -96,8 +126,17 @@ def run_creative(ctx: StageContext) -> None:
         used_ids.add(package["outro_asset_id"])
         generated.append((clip, package))
 
+    logger.info(
+        "creative[%s]: %d clip(s) processed, %d already complete",
+        ctx.job.id,
+        len(generated),
+        len(approved_clips) - len(generated),
+    )
+
     # Do not mutate even the in-memory manifest until every approved clip has a
     # valid package. This keeps persistence all-or-nothing on model failures.
+    # An all-skipped run leaves this empty and still falls through to the gate
+    # save below — that is what parks a re-opened job back at the creative gate.
     for clip, package in generated:
         clip.update(compose_manifest_fields(package))
 
@@ -290,6 +329,46 @@ def validate_creative_manifest(
     if not approved:
         raise CreativeError("creative: manifest has no approved clips")
     return data, approved
+
+
+def _clip_is_done(clip: Mapping[str, object]) -> bool:
+    """True when a clip already carries every creative field this stage writes.
+
+    All-or-nothing by design: a clip missing even one DONE_FIELDS entry (a
+    hand-edited manifest, or a run that died mid-write) is re-processed, because
+    the backend creative gate refuses to advance on a partially written clip.
+    Deliberately does NOT look at the ``assembled`` checkpoint — a clip whose
+    creative succeeded but whose assembly never ran is done for THIS stage.
+    """
+
+    for field in DONE_FIELDS:
+        value = clip.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return False
+    return True
+
+
+def _seed_used_ids(manifest: Mapping[str, Any]) -> set[str]:
+    """Collect every library asset id already selected anywhere in the manifest.
+
+    Scans ALL clips — approved or not, assembled or not — so a new selection can
+    never collide with one an earlier pass recorded. Unapproved clips carry no
+    selections in practice; including them costs nothing and keeps the seed
+    correct for a clip that was de-approved between passes.
+    """
+
+    used: set[str] = set()
+    clips = manifest.get("clips")
+    if not isinstance(clips, list):
+        return used
+    for raw_clip in clips:
+        if not isinstance(raw_clip, Mapping):
+            continue
+        for field in SELECTION_ID_FIELDS:
+            value = raw_clip.get(field)
+            if isinstance(value, str) and value.strip():
+                used.add(value)
+    return used
 
 
 def _required_clip_string(clip: Mapping[str, object], field: str) -> str:

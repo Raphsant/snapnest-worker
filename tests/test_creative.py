@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from worker.jobs import Job
 from worker.library import LibraryCatalog
 from worker.stages import StageContext
 from worker.stages.creative import (
+    DONE_FIELDS,
     CreativeError,
     compose_manifest_fields,
     extract_json,
@@ -310,6 +312,52 @@ def _approved_manifest(clip_ids: tuple[str, ...] = ("clip_01",)) -> dict[str, An
     }
 
 
+def _done_clip(
+    clip_id: str = "clip_01",
+    *,
+    hook_asset_id: str = "H01",
+    outro_asset_id: str = "O01",
+) -> dict[str, Any]:
+    """An approved clip a previous pass already finished creative for.
+
+    Carries an ``assembled`` checkpoint too, so the tests prove the skip keys
+    off the creative fields rather than off assembly, and that the checkpoint
+    survives this stage's full-manifest overwrite.
+    """
+
+    return {
+        "id": clip_id,
+        "approved": True,
+        "category": "mindset",
+        "transcript": "Algo importante dijo Eduardo.",
+        "hook_prompt": None,
+        "close_prompt": None,
+        "hook_text": "YA TIENE GANCHO",
+        "hook_asset_id": hook_asset_id,
+        "close_text": "YA TIENE CIERRE",
+        "outro_asset_id": outro_asset_id,
+        "post_copy": "### YouTube Shorts\nya publicado",
+        "assembled": {
+            "s3Key": f"pipeline/job-1/final/final_{clip_id}_9x16.mp4",
+            "completedAt": "2026-08-01T00:00:00+00:00",
+        },
+    }
+
+
+def _new_clip(clip_id: str = "clip_02") -> dict[str, Any]:
+    """A freshly approved clip with no creative fields yet."""
+
+    return {
+        "id": clip_id,
+        "approved": True,
+        "category": "mindset",
+        "transcript": "Un segundo momento importante.",
+        "hook_prompt": None,
+        "close_prompt": None,
+        "post_copy": None,
+    }
+
+
 def _patch_common(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     saved: dict[str, Any] = {}
 
@@ -375,6 +423,35 @@ def _run_creative_capture(
     with workspace:
         run_creative(cast(StageContext, ctx))
     return saved["manifest"], fake_s3
+
+
+def _run_creative_with_messages(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    manifest: dict[str, Any],
+    texts: list[str],
+) -> tuple[dict[str, Any], _FakeMessages, _FakeS3]:
+    """Run the stage against a canned Anthropic transcript; capture the save.
+
+    Unlike _run_creative_capture this keeps the real _generate_clip_package, so
+    the user message (and therefore the ALREADY SELECTED line) is observable.
+    An empty ``texts`` list means "no model call is expected" — an unexpected
+    create() pops from an empty list and fails the test loudly.
+    """
+
+    saved = _patch_common(monkeypatch)
+    fake_messages = _FakeMessages(texts)
+    monkeypatch.setattr(
+        "worker.stages.creative._anthropic_client",
+        lambda cfg: SimpleNamespace(messages=fake_messages),
+    )
+
+    ctx, fake_s3, workspace = _make_ctx(tmp_path, manifest)
+    with workspace:
+        run_creative(cast(StageContext, ctx))
+    # KeyError here would itself mean the gate save never ran.
+    return saved["manifest"], fake_messages, fake_s3
 
 
 def test_run_creative_emits_overlay_text_and_asset_selections(
@@ -456,6 +533,122 @@ def test_run_creative_two_clips_dedups_selections(
         "O01",
     )
     assert (clips[1]["hook_asset_id"], clips[1]["outro_asset_id"]) == (
+        "H02",
+        "O02",
+    )
+
+
+def test_run_creative_skips_a_clip_that_already_has_creative_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    done = _done_clip()
+    before = copy.deepcopy(done)
+
+    saved, fake_messages, _ = _run_creative_with_messages(
+        monkeypatch,
+        tmp_path,
+        manifest={"status": "approved", "clips": [done]},
+        texts=[],
+    )
+
+    # The whole point: no model call, so no Anthropic spend on a finished clip.
+    assert fake_messages.calls == []
+
+    stored = saved["clips"][0]
+    for field in DONE_FIELDS:
+        assert stored[field] == before[field]
+    # The assembled checkpoint survives the stage's full-manifest overwrite.
+    assert stored["assembled"] == before["assembled"]
+
+
+def test_run_creative_all_skipped_still_reaches_the_creative_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # A re-opened job whose approved clips are all already done must still park
+    # at AWAITING_CREATIVE_APPROVAL, not fall through with nothing persisted.
+    manifest = {
+        "status": "approved",
+        "clips": [
+            _done_clip("clip_01"),
+            _done_clip("clip_02", hook_asset_id="H02", outro_asset_id="O02"),
+        ],
+    }
+
+    saved, fake_messages, fake_s3 = _run_creative_with_messages(
+        monkeypatch,
+        tmp_path,
+        manifest=manifest,
+        texts=[],
+    )
+
+    assert fake_messages.calls == []
+    # The gate save ran (the helper would KeyError otherwise) with a complete,
+    # linted manifest, and the S3 copy was refreshed alongside it.
+    assert [clip["id"] for clip in saved["clips"]] == ["clip_01", "clip_02"]
+    assert saved["lint_violations"] == []
+    assert saved["lint_warnings"] == []
+    assert "pipeline/job-1/manifest.json" in fake_s3.uploads
+
+
+def test_run_creative_processes_a_clip_missing_one_creative_field(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Selections but no post_copy: skipping on the asset id alone would strand
+    # the job, because the backend creative gate requires all five fields.
+    partial = _done_clip()
+    del partial["post_copy"]
+
+    fresh = {**_package(), "hook_asset_id": "H02", "outro_asset_id": "O02"}
+    saved, fake_messages, _ = _run_creative_with_messages(
+        monkeypatch,
+        tmp_path,
+        manifest={"status": "approved", "clips": [partial]},
+        texts=[json.dumps(fresh)],
+    )
+
+    assert len(fake_messages.calls) == 1
+    # Seeding scans every clip, so the clip's OWN stale ids are off the table
+    # and it is re-selected fresh. Documented consequence of the whole-manifest
+    # seed, not an accident.
+    user = fake_messages.calls[0]["messages"][0]["content"]
+    assert "ALREADY SELECTED IN THIS BATCH (do not reuse): H01, O01" in user
+
+    stored = saved["clips"][0]
+    assert stored["post_copy"].startswith("### YouTube Shorts")
+    assert (stored["hook_asset_id"], stored["outro_asset_id"]) == ("H02", "O02")
+
+
+def test_run_creative_extension_run_processes_only_the_new_clip(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    done = _done_clip("clip_01")
+    before = copy.deepcopy(done)
+
+    fresh = {**_package(), "hook_asset_id": "H02", "outro_asset_id": "O02"}
+    saved, fake_messages, _ = _run_creative_with_messages(
+        monkeypatch,
+        tmp_path,
+        manifest={"status": "approved", "clips": [done, _new_clip("clip_02")]},
+        texts=[json.dumps(fresh)],
+    )
+
+    # Exactly one model call, and it is the new clip.
+    assert len(fake_messages.calls) == 1
+    user = fake_messages.calls[0]["messages"][0]["content"]
+    assert "CLIP ID: clip_02" in user
+    # The done clip's ids were seeded, so the new selection cannot collide with
+    # what an earlier pass already shipped.
+    assert "ALREADY SELECTED IN THIS BATCH (do not reuse): H01, O01" in user
+
+    stored_done, stored_new = saved["clips"]
+    for field in DONE_FIELDS:
+        assert stored_done[field] == before[field]
+    assert stored_done["assembled"] == before["assembled"]
+    assert (stored_new["hook_asset_id"], stored_new["outro_asset_id"]) == (
         "H02",
         "O02",
     )
