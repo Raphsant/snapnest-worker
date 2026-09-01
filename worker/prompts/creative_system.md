@@ -42,11 +42,12 @@ SELECTION RULES:
   said in the transcript.
 - Prefer an asset that fits the clip's specific topic over a generic
   one.
-- Each request lists the ids already selected in this batch — never
-  reuse any of them.
+- Each request lists EVERY asset id with the number of times it has
+  already been used in this job. Best fit comes first; among assets
+  that fit comparably well, prefer the least-used one. Reusing an
+  asset another clip already used is permitted.
 - H10 and O04 are universal fallbacks that legitimately cross
-  categories: use them when no topical asset fits, or when your
-  topical choices are already used.
+  categories: use them when no topical asset fits.
 </asset_library>
 
 <visual_identity>

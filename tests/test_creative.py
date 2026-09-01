@@ -131,17 +131,38 @@ def test_validate_asset_selection_wrong_type_raises() -> None:
         )
 
 
-def test_validate_asset_selection_reused_id_raises() -> None:
-    with pytest.raises(
-        ValueError, match="'H01' was already selected in this batch"
-    ):
+def test_validate_asset_selection_allows_reuse_quietly(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Reuse is allowed policy — one prior use is not even worth a warning.
+    with caplog.at_level("WARNING", logger="worker.stages.creative"):
         validate_asset_selection(
             _package(),
             _catalog(),
             category="mindset",
             clip_id="clip_02",
-            used_ids={"H01", "O02"},
+            usage_counts={"H01": 1, "O01": 1},
         )
+
+    assert caplog.text == ""
+
+
+def test_validate_asset_selection_warns_on_repeated_reuse(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING", logger="worker.stages.creative"):
+        validate_asset_selection(
+            _package(),
+            _catalog(),
+            category="mindset",
+            clip_id="clip_03",
+            usage_counts={"H01": 2, "O01": 1},
+        )
+
+    assert "hook_asset_id=H01 already used 2 time(s)" in caplog.text
+    assert "reuse allowed" in caplog.text
+    # O01 sits below the threshold, so it stays quiet.
+    assert "outro_asset_id=O01" not in caplog.text
 
 
 def test_validate_asset_selection_category_mismatch_warns_only(
@@ -435,7 +456,7 @@ def _run_creative_with_messages(
     """Run the stage against a canned Anthropic transcript; capture the save.
 
     Unlike _run_creative_capture this keeps the real _generate_clip_package, so
-    the user message (and therefore the ALREADY SELECTED line) is observable.
+    the user message (and therefore the availability block) is observable.
     An empty ``texts`` list means "no model call is expected" — an unexpected
     create() pops from an empty list and fails the test loudly.
     """
@@ -499,7 +520,7 @@ def test_run_creative_still_lints_stale_prompt_fields(
     assert {v["matched_word"].lower() for v in violations} == {"stc", "logo"}
 
 
-def test_run_creative_two_clips_dedups_selections(
+def test_run_creative_two_clips_report_usage_counts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -522,10 +543,13 @@ def test_run_creative_two_clips_dedups_selections(
 
     first_user = fake_messages.calls[0]["messages"][0]["content"]
     second_user = fake_messages.calls[1]["messages"][0]["content"]
-    assert "ALREADY SELECTED" not in first_user
-    assert (
-        "ALREADY SELECTED IN THIS BATCH (do not reuse): H01, O01" in second_user
-    )
+    # Every asset is listed on every request, untouched ones included.
+    assert "HOOKS (id — times used this job): H01 — 0, H02 — 0" in first_user
+    assert "OUTROS (id — times used this job): O01 — 0, O02 — 0" in first_user
+    assert "Reusing an asset is allowed." in first_user
+    # The first clip's picks come back at one use for the second clip.
+    assert "HOOKS (id — times used this job): H01 — 1, H02 — 0" in second_user
+    assert "OUTROS (id — times used this job): O01 — 1, O02 — 0" in second_user
 
     clips = saved["manifest"]["clips"]
     assert (clips[0]["hook_asset_id"], clips[0]["outro_asset_id"]) == (
@@ -610,11 +634,12 @@ def test_run_creative_processes_a_clip_missing_one_creative_field(
     )
 
     assert len(fake_messages.calls) == 1
-    # Seeding scans every clip, so the clip's OWN stale ids are off the table
-    # and it is re-selected fresh. Documented consequence of the whole-manifest
-    # seed, not an accident.
+    # Seeding scans every clip, so the clip's OWN stale ids come back at one
+    # use in its own availability block. Documented consequence of the
+    # whole-manifest seed: it nudges, it no longer forbids.
     user = fake_messages.calls[0]["messages"][0]["content"]
-    assert "ALREADY SELECTED IN THIS BATCH (do not reuse): H01, O01" in user
+    assert "HOOKS (id — times used this job): H01 — 1, H02 — 0" in user
+    assert "OUTROS (id — times used this job): O01 — 1, O02 — 0" in user
 
     stored = saved["clips"][0]
     assert stored["post_copy"].startswith("### YouTube Shorts")
@@ -640,9 +665,10 @@ def test_run_creative_extension_run_processes_only_the_new_clip(
     assert len(fake_messages.calls) == 1
     user = fake_messages.calls[0]["messages"][0]["content"]
     assert "CLIP ID: clip_02" in user
-    # The done clip's ids were seeded, so the new selection cannot collide with
-    # what an earlier pass already shipped.
-    assert "ALREADY SELECTED IN THIS BATCH (do not reuse): H01, O01" in user
+    # The done clip's ids were seeded, so the new clip sees what an earlier
+    # pass shipped at one use and leans toward the untouched assets.
+    assert "HOOKS (id — times used this job): H01 — 1, H02 — 0" in user
+    assert "OUTROS (id — times used this job): O01 — 1, O02 — 0" in user
 
     stored_done, stored_new = saved["clips"]
     for field in DONE_FIELDS:

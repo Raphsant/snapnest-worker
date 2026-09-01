@@ -246,10 +246,13 @@ def test_unknown_asset_id_hard_fails_naming_the_id(
     assert harness.s3.uploads == []
 
 
-def test_duplicate_selection_across_clips_hard_fails_naming_both(
+def test_duplicate_selection_across_clips_passes_as_a_warning(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # Reuse within a job is allowed policy: the stage records the repeat and
+    # advances instead of blocking the run.
     manifest = _manifest(
         [
             _clip(),
@@ -258,14 +261,15 @@ def test_duplicate_selection_across_clips_hard_fails_naming_both(
     )
     harness = _harness(monkeypatch, tmp_path, manifest)
 
-    with pytest.raises(GenerateError) as raised:
+    with caplog.at_level(logging.INFO):
         harness.run()
 
-    message = str(raised.value)
+    assert harness.s3.uploads == [f"pipeline/{JOB_ID}/manifest.json"]
+    message = caplog.text
+    assert "selection lint warning" in message
     assert "'H01'" in message
     assert CLIP_ID in message
     assert SECOND_CLIP_ID in message
-    assert harness.s3.uploads == []
 
 
 def test_missing_catalog_fails_the_stage_clearly(

@@ -5,12 +5,13 @@ from __future__ import annotations
 import copy
 import json
 import logging
-from collections.abc import Mapping, Set as AbstractSet
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 from worker import jobs
-from worker.library import LibraryCatalog, format_for_prompt
+from worker.library import LibraryAsset, LibraryCatalog, format_for_prompt
 from worker.lint import lint_prompts
 
 if TYPE_CHECKING:
@@ -50,8 +51,17 @@ DONE_FIELDS: tuple[str, ...] = (
     "post_copy",
 )
 
-# Library selection fields harvested from the manifest to seed used_ids.
+# Library selection fields harvested from the manifest to seed usage_counts.
 SELECTION_ID_FIELDS: tuple[str, ...] = ("hook_asset_id", "outro_asset_id")
+
+# Reuse within a job is ALLOWED policy: selection prefers the least-used asset
+# among comparable fits, and repetition is never an error. This threshold only
+# decides when a repeat is loud enough to log for the operator — an asset the
+# model has already leaned on twice is worth a look, a single repeat is not.
+REUSE_WARN_THRESHOLD = 2
+
+# Immutable empty default for the usage_counts keyword.
+_NO_USAGE: Mapping[str, int] = MappingProxyType({})
 
 # Overlay copy should fit ONE line of the 9:16 drawtext overlay at full size.
 # These caps are WARNING thresholds only — never a hard failure. They are now
@@ -79,11 +89,10 @@ def run_creative(ctx: StageContext) -> None:
 
     generated: list[tuple[dict[str, Any], dict[str, str]]] = []
     # Seeded from EVERY clip in the manifest, not just the ones processed
-    # below: on an extension run the ids an earlier pass already shipped must
-    # stay off the table. lint_selections would catch such a collision at the
-    # generate stage, but only among still-approved clips and only after the
-    # model spend, so this is the real guard.
-    used_ids: set[str] = _seed_used_ids(manifest)
+    # below: on an extension run the counts an earlier pass shipped carry into
+    # this run's availability block, so "least-used" means least-used across
+    # the whole job rather than only within this pass.
+    usage_counts: dict[str, int] = _seed_usage_counts(manifest)
     for clip in approved_clips:
         clip_id = _required_clip_string(clip, "id")
         if _clip_is_done(clip):
@@ -105,7 +114,7 @@ def run_creative(ctx: StageContext) -> None:
                 clip_id=clip_id,
                 category=category,
                 transcript=transcript,
-                used_ids=used_ids,
+                usage_counts=usage_counts,
             )
         except Exception as exc:
             raise CreativeError(f"creative: clip {clip_id} failed: {exc}") from exc
@@ -122,8 +131,9 @@ def run_creative(ctx: StageContext) -> None:
             package["compliance_check"],
             response_size,
         )
-        used_ids.add(package["hook_asset_id"])
-        used_ids.add(package["outro_asset_id"])
+        for field in SELECTION_ID_FIELDS:
+            selected = package[field]
+            usage_counts[selected] = usage_counts.get(selected, 0) + 1
         generated.append((clip, package))
 
     logger.info(
@@ -233,14 +243,16 @@ def validate_asset_selection(
     *,
     category: str,
     clip_id: str,
-    used_ids: AbstractSet[str] = frozenset(),
+    usage_counts: Mapping[str, int] = _NO_USAGE,
 ) -> None:
-    """Require selected ids to exist, match type, and be unused in this batch.
+    """Require selected ids to exist and match type; warn on heavy reuse.
 
-    A missing id, a type mismatch, or an id already selected for another clip
-    raises ValueError (feeding the repair retry). A clip category absent from
-    the asset's categories is only a warning: universal assets legitimately
-    cross categories.
+    A missing id or a type mismatch raises ValueError (feeding the repair
+    retry). Reuse is NOT an error — an id another clip in this job already
+    carries is a legitimate selection — it is only logged once the asset's
+    in-job usage has reached REUSE_WARN_THRESHOLD. A clip category absent from
+    the asset's categories is likewise only a warning: universal assets
+    legitimately cross categories.
     """
 
     for field, expected_type in (
@@ -258,10 +270,15 @@ def validate_asset_selection(
                 f"{field} {asset_id!r} has type {asset.type!r}, "
                 f"expected {expected_type!r}"
             )
-        if asset_id in used_ids:
-            raise ValueError(
-                f"{field} {asset_id!r} was already selected in this batch "
-                f"(used: {', '.join(sorted(used_ids))})"
+        used = usage_counts.get(asset_id, 0)
+        if used >= REUSE_WARN_THRESHOLD:
+            logger.warning(
+                "creative: clip=%s %s=%s already used %d time(s) in this job "
+                "(reuse allowed)",
+                clip_id,
+                field,
+                asset_id,
+                used,
             )
         if category not in asset.category:
             logger.warning(
@@ -273,6 +290,31 @@ def validate_asset_selection(
                 category,
                 list(asset.category),
             )
+
+
+def compose_availability_block(
+    catalog: LibraryCatalog, usage_counts: Mapping[str, int]
+) -> str:
+    """Render every asset id with its in-job usage, plus the selection rule.
+
+    EVERY id is listed on EVERY request — unused ones at 0 included — so the
+    model always picks from the whole library and can see which assets this job
+    has already leaned on. The counts are advisory: they steer the tiebreak
+    between comparable fits, they do not fence anything off.
+    """
+
+    def line(label: str, assets: list[LibraryAsset]) -> str:
+        pairs = ", ".join(
+            f"{asset.id} — {usage_counts.get(asset.id, 0)}" for asset in assets
+        )
+        return f"{label} (id — times used this job): {pairs}"
+
+    return (
+        f"{line('HOOKS', catalog.hooks())}\n"
+        f"{line('OUTROS', catalog.outros())}\n"
+        "Pick the best fit for this clip; among comparable fits prefer the "
+        "least-used. Reusing an asset is allowed."
+    )
 
 
 def compose_manifest_fields(package: Mapping[str, str]) -> dict[str, str]:
@@ -348,27 +390,28 @@ def _clip_is_done(clip: Mapping[str, object]) -> bool:
     return True
 
 
-def _seed_used_ids(manifest: Mapping[str, Any]) -> set[str]:
-    """Collect every library asset id already selected anywhere in the manifest.
+def _seed_usage_counts(manifest: Mapping[str, Any]) -> dict[str, int]:
+    """Count how often each library asset id is selected across the manifest.
 
-    Scans ALL clips — approved or not, assembled or not — so a new selection can
-    never collide with one an earlier pass recorded. Unapproved clips carry no
-    selections in practice; including them costs nothing and keeps the seed
-    correct for a clip that was de-approved between passes.
+    Scans ALL clips — approved or not, assembled or not — so the availability
+    block reports usage for the whole job, including what earlier passes
+    shipped. Unapproved clips carry no selections in practice; including them
+    costs nothing and keeps the count correct for a clip that was de-approved
+    between passes.
     """
 
-    used: set[str] = set()
+    counts: dict[str, int] = {}
     clips = manifest.get("clips")
     if not isinstance(clips, list):
-        return used
+        return counts
     for raw_clip in clips:
         if not isinstance(raw_clip, Mapping):
             continue
         for field in SELECTION_ID_FIELDS:
             value = raw_clip.get(field)
             if isinstance(value, str) and value.strip():
-                used.add(value)
-    return used
+                counts[value] = counts.get(value, 0) + 1
+    return counts
 
 
 def _required_clip_string(clip: Mapping[str, object], field: str) -> str:
@@ -419,20 +462,16 @@ def _generate_clip_package(
     clip_id: str,
     category: str,
     transcript: str,
-    used_ids: AbstractSet[str] = frozenset(),
+    usage_counts: Mapping[str, int] = _NO_USAGE,
 ) -> tuple[dict[str, str], int]:
     """Call Creative for one clip, with one parse/validation/selection repair retry."""
 
     user = (
         f"CLIP ID: {clip_id}\n"
         f"CATEGORY: {category}\n\n"
-        f"TRANSCRIPT:\n{transcript}"
+        f"TRANSCRIPT:\n{transcript}\n\n"
+        f"{compose_availability_block(catalog, usage_counts)}"
     )
-    if used_ids:
-        user += (
-            "\n\nALREADY SELECTED IN THIS BATCH (do not reuse): "
-            + ", ".join(sorted(used_ids))
-        )
     messages = [{"role": "user", "content": user}]
 
     first = _create_message(
@@ -448,7 +487,7 @@ def _generate_clip_package(
             catalog,
             category=category,
             clip_id=clip_id,
-            used_ids=used_ids,
+            usage_counts=usage_counts,
         )
         return package, len(first_text.encode("utf-8"))
     except ValueError as first_error:
@@ -480,7 +519,7 @@ def _generate_clip_package(
             catalog,
             category=category,
             clip_id=clip_id,
-            used_ids=used_ids,
+            usage_counts=usage_counts,
         )
     except ValueError as second_error:
         raise ValueError(
@@ -495,13 +534,17 @@ def _validated_package(
     *,
     category: str,
     clip_id: str,
-    used_ids: AbstractSet[str],
+    usage_counts: Mapping[str, int],
 ) -> dict[str, str]:
     """Parse, shape-validate, and selection-validate one model response."""
 
     package = validate_creative_json(extract_json(text))
     validate_asset_selection(
-        package, catalog, category=category, clip_id=clip_id, used_ids=used_ids
+        package,
+        catalog,
+        category=category,
+        clip_id=clip_id,
+        usage_counts=usage_counts,
     )
     return package
 

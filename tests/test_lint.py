@@ -309,7 +309,7 @@ def test_wrong_asset_type_is_a_violation() -> None:
     assert "has type 'outro', expected 'hook'" in violation["reason"]
 
 
-def test_cross_clip_duplicate_reports_every_offender() -> None:
+def test_cross_clip_duplicate_is_a_warning_naming_every_offender() -> None:
     manifest = {
         "clips": [
             _selection_clip("clip_01"),
@@ -318,20 +318,22 @@ def test_cross_clip_duplicate_reports_every_offender() -> None:
         ]
     }
 
-    violations = lint_selections(manifest, _selection_catalog()).violations
-    offenders = {(v["clipId"], v["field"]) for v in violations}
+    result = lint_selections(manifest, _selection_catalog())
+    # Reuse within a job is allowed policy: recorded, never blocking.
+    assert result.violations == []
+    offenders = {(w["clipId"], w["field"]) for w in result.warnings}
     assert offenders == {
         ("clip_01", "hook_asset_id"),
         ("clip_02", "hook_asset_id"),
         ("clip_01", "outro_asset_id"),
         ("clip_03", "outro_asset_id"),
     }
-    # Every duplicate violation names all clips involved for that asset.
-    h01 = [v for v in violations if "'H01'" in v["reason"]]
+    # Every duplicate warning names all clips involved for that asset.
+    h01 = [w for w in result.warnings if "'H01'" in w["reason"]]
     assert all(
-        "clip_01.hook_asset_id" in v["reason"]
-        and "clip_02.hook_asset_id" in v["reason"]
-        for v in h01
+        "clip_01.hook_asset_id" in w["reason"]
+        and "clip_02.hook_asset_id" in w["reason"]
+        for w in h01
     )
 
 

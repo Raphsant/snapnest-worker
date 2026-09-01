@@ -177,13 +177,14 @@ def lint_selections(
 
     Same result shape as ``lint_prompts``, with entries of
     ``{clipId, field, reason}``. Violations (the generate stage hard-fails on
-    these): a missing/empty selection field, an id absent from the catalog, an
-    id of the wrong type, or the same id selected by more than one approved
-    clip (every clip involved is reported, hook and outro fields checked
-    jointly). Warnings (recorded only): the clip's category not being in the
-    selected asset's category list — universal assets legitimately cross
-    categories. Unapproved clips are ignored entirely; a structurally
-    unusable manifest yields an empty result, as in ``lint_prompts``.
+    these): a missing/empty selection field, an id absent from the catalog, or
+    an id of the wrong type. Warnings (recorded only): the clip's category not
+    being in the selected asset's category list — universal assets
+    legitimately cross categories — and the same id selected by more than one
+    approved clip, which is allowed reuse rather than a defect (every clip
+    involved is still reported, hook and outro fields checked jointly).
+    Unapproved clips are ignored entirely; a structurally unusable manifest
+    yields an empty result, as in ``lint_prompts``.
     """
 
     clips = manifest.get("clips")
@@ -249,12 +250,15 @@ def lint_selections(
                     }
                 )
 
+    # Reuse within a job is allowed policy: selection prefers the least-used
+    # asset among comparable fits, so repetition is worth recording but never
+    # blocks. Every clip sharing the asset is still named.
     for asset_id, users in selected_by.items():
         if len(users) < 2:
             continue
         usage = ", ".join(f"{c}.{f}" for c, f in users)
         for clip_id, field in users:
-            violations.append(
+            warnings.append(
                 {
                     "clipId": clip_id,
                     "field": field,
