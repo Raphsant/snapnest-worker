@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -33,6 +34,7 @@ class ApprovedClip:
     start: str
     end: str
     duration_seconds: int | float
+    assembled: bool = False
 
 
 @dataclass(frozen=True)
@@ -57,7 +59,14 @@ def run_cut(ctx: StageContext) -> None:
 
     rendered: list[RenderedClip] = []
     for clip in clips:
-        main = ctx.workspace.path(f"{clip.clip_id}.mp4")
+        if clip.assembled:
+            logger.info(
+                "cut[%s]: clip=%s already assembled; skipping",
+                ctx.job.id,
+                clip.clip_id,
+            )
+            continue
+        main =ctx.workspace.path(f"{clip.clip_id}.mp4")
         first_five = ctx.workspace.path(f"{clip.clip_id}_first5.mp4")
         last_five = ctx.workspace.path(f"{clip.clip_id}_last5.mp4")
 
@@ -104,7 +113,7 @@ def run_cut(ctx: StageContext) -> None:
         encoding="utf-8",
     )
     ctx.workspace.upload(manifest_path, f"{prefix}manifest.json")
-    logger.info("cut[%s]: complete; uploaded %d clip(s)", ctx.job.id, len(clips))
+    logger.info("cut[%s]: complete; uploaded %d clip(s)", ctx.job.id, len(rendered))
 
 
 # --------------------------------------------------------------------------- #
@@ -250,7 +259,19 @@ def _validate_approved_clip(clip: dict[str, object], index: int) -> ApprovedClip
         start=start,
         end=end,
         duration_seconds=duration,
+        assembled=_clip_is_done(clip),
     )
+
+
+def _clip_is_done(clip: Mapping[str, object]) -> bool:
+    """True when a clip already carries a non-null ``assembled`` checkpoint.
+
+    An assembled clip's main/subclip artifacts were already rendered, uploaded,
+    and consumed downstream, so extension runs must not re-render or re-upload
+    them. A missing key and an explicit null both mean "not done".
+    """
+
+    return clip.get("assembled") is not None
 
 
 def _required_string(clip: dict[str, object], field: str, index: int) -> str:
