@@ -213,6 +213,11 @@ def test_compose_manifest_fields_emits_overlay_text_and_asset_ids() -> None:
             "¿Tienes un proceso? Zombie Hour LIVE. #trading\n\n"
             "Compliance check: PASS"
         ),
+        "captions": {
+            "youtube": "Lección de proceso. Suscríbete. #trading",
+            "tiktok": "La disciplina se practica. #trading",
+            "instagram": "¿Tienes un proceso? Zombie Hour LIVE. #trading",
+        },
     }
     assert "hook_prompt" not in fields
     assert "close_prompt" not in fields
@@ -674,6 +679,10 @@ def test_run_creative_extension_run_processes_only_the_new_clip(
     for field in DONE_FIELDS:
         assert stored_done[field] == before[field]
     assert stored_done["assembled"] == before["assembled"]
+    # A batch-1 clip written before "captions" existed is still done: it was
+    # skipped above (one model call, for clip_02) and never gains the key.
+    assert "captions" not in before
+    assert "captions" not in stored_done
     assert (stored_new["hook_asset_id"], stored_new["outro_asset_id"]) == (
         "H02",
         "O02",

@@ -317,13 +317,16 @@ def compose_availability_block(
     )
 
 
-def compose_manifest_fields(package: Mapping[str, str]) -> dict[str, str]:
+def compose_manifest_fields(package: Mapping[str, str]) -> dict[str, Any]:
     """Compose the manifest fields written to each approved clip.
 
     Emits native overlay copy (hook_text/close_text) consumed by the
     assembler's drawtext, the selected library asset ids (hooks/outros are
     pre-generated — no generation prompts are written), and the platform
-    post copy.
+    post copy. ``post_copy`` stays the single folded string the dashboard
+    reads; ``captions`` carries the same three platform captions raw and
+    unfolded. ``captions`` is deliberately NOT in DONE_FIELDS, so clips
+    written before it existed still count as done.
     """
 
     return {
@@ -337,6 +340,11 @@ def compose_manifest_fields(package: Mapping[str, str]) -> dict[str, str]:
             f'### Instagram\n{package["caption_instagram"]}\n\n'
             f'Compliance check: {package["compliance_check"]}'
         ),
+        "captions": {
+            "youtube": package["caption_youtube"],
+            "tiktok": package["caption_tiktok"],
+            "instagram": package["caption_instagram"],
+        },
     }
 
 
