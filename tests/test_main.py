@@ -13,6 +13,7 @@ from worker.main import (
     CHECKPOINT_VISIBILITY_TIMEOUT_S,
     Worker,
     _needs_download,
+    parse_message_body,
     resolve_entry_stage,
 )
 from worker.queue import Message
@@ -297,3 +298,19 @@ def test_db_operation_success_does_not_reconnect(
     assert reconnected is False
     assert worker._conn is original_conn
     original_conn.close.assert_not_called()
+
+
+def test_parse_message_body_accepts_transcribe_stage() -> None:
+    parsed = parse_message_body({"jobId": "job-1", "stage": "transcribe"})
+
+    assert parsed.job_id == "job-1"
+    assert parsed.entry_stage == "transcribe"
+
+
+def test_parse_message_body_rejects_unknown_stage() -> None:
+    with pytest.raises(ValueError):
+        parse_message_body({"jobId": "job-1", "stage": "transcription"})
+
+
+def test_resolve_entry_stage_never_redirects_transcribe() -> None:
+    assert resolve_entry_stage("transcribe", _youtube_job("QUEUED")) == "transcribe"

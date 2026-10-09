@@ -51,6 +51,7 @@ from worker.stages.curate import run_curate  # noqa: E402
 from worker.stages.download import run_download  # noqa: E402
 from worker.stages.generate import run_generate  # noqa: E402
 from worker.stages.ingest import run_ingest  # noqa: E402
+from worker.stages.transcribe import run_transcribe  # noqa: E402
 
 # Message entry stage -> required DB status + ordered stages to execute.
 ENTRY_POINTS: dict[str, EntryPoint] = {
@@ -92,6 +93,12 @@ ENTRY_POINTS: dict[str, EntryPoint] = {
     "assemble": EntryPoint(
         required_status=PipelineJobStatus.CREATIVE_APPROVED,
         stages=(("assemble", cast(Stage, run_assemble)),),
+    ),
+    # Transcribe-only (agency intake): one source file -> transcript.srt/.json.
+    # Never redirected to download; no corrections, bleep, or curation.
+    "transcribe": EntryPoint(
+        required_status=PipelineJobStatus.QUEUED,
+        stages=(("transcribe", run_transcribe),),
     ),
 }
 

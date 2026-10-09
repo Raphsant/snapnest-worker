@@ -31,6 +31,13 @@ def test_assemble_entry_requires_creative_approval() -> None:
     assert [name for name, _ in entry.stages] == ["assemble"]
 
 
+def test_transcribe_entry_is_standalone_and_requires_queued() -> None:
+    entry = ENTRY_POINTS["transcribe"]
+
+    assert entry.required_status is PipelineJobStatus.QUEUED
+    assert [name for name, _ in entry.stages] == ["transcribe"]
+
+
 def test_stage_context_has_expected_fields() -> None:
     field_names = {f.name for f in dataclasses.fields(StageContext)}
     assert field_names == {
