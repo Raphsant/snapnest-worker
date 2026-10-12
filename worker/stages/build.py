@@ -22,6 +22,8 @@ from datetime import date
 from typing import TYPE_CHECKING, Any
 
 from worker import jobs
+from worker.artifacts import clip_caption_key
+from worker.captions import CaptionError, build_clip_srt, parse_master_srt, parse_srt_timestamp
 
 if TYPE_CHECKING:
     from worker.stages import StageContext
@@ -57,9 +59,8 @@ def run_build(ctx: StageContext) -> None:
     mindset_key = _require_key(state, "curate", "mindset")
     technical_key = _require_key(state, "curate", "technical")
 
-    srt_text = ws.download(srt_key, "build_input.srt").read_text(
-        encoding="utf-8-sig", errors="replace"
-    )
+    srt_path = ws.download(srt_key, "build_input.srt")
+    srt_text = srt_path.read_text(encoding="utf-8-sig", errors="replace")
     bleep_ranges = _load_bleep_ranges(ws.download(bleep_key, "build_bleeps.json"))
     curations = [
         json.loads(ws.download(mindset_key, "build_mindset.json").read_text()),
@@ -85,12 +86,45 @@ def run_build(ctx: StageContext) -> None:
     manifest_key = f"pipeline/{job.id}/manifest.json"
     ws.upload(out, manifest_key)
 
+    _write_caption_slices(ctx, manifest, srt_path.read_bytes())
+
     jobs.save_manifest_awaiting_approval(ctx.conn, job.id, manifest)
 
     state = ws.read_state()
     state["build"] = {"manifest_key": manifest_key}
     ws.write_state(state)
     logger.info("build[%s]: manifest stored; awaiting manifest approval", job.id)
+
+
+def _write_caption_slices(
+    ctx: StageContext, manifest: dict[str, Any], master_srt_bytes: bytes
+) -> None:
+    """Upload a generated clip-relative caption slice for every manifest clip."""
+
+    ws = ctx.workspace
+    job = ctx.job
+    try:
+        blocks = parse_master_srt(master_srt_bytes)
+    except CaptionError as exc:
+        raise BuildError(f"build: master SRT unusable for caption slices: {exc}") from exc
+
+    for clip in manifest["clips"]:
+        clip_id = clip["id"]
+        try:
+            data = build_clip_srt(
+                blocks,
+                start_block=clip["start_block"],
+                end_block=clip["end_block"],
+                clip_start_ms=parse_srt_timestamp(clip["start"]),
+                clip_id=clip_id,
+            )
+        except CaptionError as exc:
+            raise BuildError(f"build: caption slice failed for {clip_id}: {exc}") from exc
+        local = ws.path(f"caption_{clip_id}.srt")
+        local.write_bytes(data)
+        ws.upload(local, clip_caption_key(job.id, clip_id))
+
+    logger.info("build[%s]: wrote %d caption slices", job.id, len(manifest["clips"]))
 
 
 # --------------------------------------------------------------------------- #

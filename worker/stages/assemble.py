@@ -16,8 +16,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, TypeVar, TypedDict, cast
 
+from botocore.exceptions import ClientError
+
 from worker import jobs
-from worker.artifacts import main_clip_key
+from worker.artifacts import edited_clip_caption_key, main_clip_key
+from worker.captions import (
+    Block,
+    CaptionError,
+    build_clip_srt,
+    format_clip_srt,
+    parse_master_srt,
+    parse_srt_timestamp,
+    validate_edited_slice,
+)
 from worker.library import LibraryAsset, LibraryCatalog
 
 if TYPE_CHECKING:
@@ -192,17 +203,6 @@ CONFIG: AssembleConfig = {
     "ffmpeg_error_tail": 1600,
 }
 
-SRT_TIMESTAMP_RE = re.compile(
-    r"(?P<hours>\d{2}):(?P<minutes>\d{2}):"
-    r"(?P<seconds>\d{2}),(?P<milliseconds>\d{3})"
-)
-SRT_BLOCK_RE = re.compile(
-    r"(?P<number>\d+)(?:\r\n|\n)"
-    r"(?P<start>\d{2}:\d{2}:\d{2},\d{3})\s+-->\s+"
-    r"(?P<end>\d{2}:\d{2}:\d{2},\d{3})[^\r\n]*"
-    r"(?:\r\n|\n)(?P<text>.*)\Z",
-    re.DOTALL,
-)
 SILENCE_EVENT_RE = re.compile(
     r"silence_(?P<event>start|end):\s*"
     r"(?P<seconds>[-+]?\d+(?:\.\d+)?)"
@@ -221,16 +221,6 @@ class AssembleStageContext(Protocol):
 
 class AssembleError(RuntimeError):
     """Raised when a final short cannot be assembled safely."""
-
-
-@dataclass(frozen=True)
-class SrtBlock:
-    """One parsed master-SRT block with verbatim subtitle text."""
-
-    number: int
-    start_ms: int
-    end_ms: int
-    text: str
 
 
 @dataclass
@@ -298,16 +288,13 @@ def run_assemble(ctx: AssembleStageContext) -> None:
         lambda: ctx.workspace.download(srt_key, "assemble/master.srt"),
         description=f"master SRT download ({srt_key})",
     )
-    master_blocks = parse_master_srt(master_path.read_bytes())
+    try:
+        master_blocks = parse_master_srt(master_path.read_bytes())
+    except CaptionError as exc:
+        raise AssembleError(str(exc)) from exc
     clip_srts = {
-        clip.clip_id: build_clip_srt(
-            master_blocks,
-            start_block=clip.start_block,
-            end_block=clip.end_block,
-            clip_start_ms=clip.start_ms,
-            clip_id=clip.clip_id,
-        )
-        for clip in clips
+        clip.clip_id: _clip_caption_bytes(ctx, master_blocks, clip)
+        for clip in pending
     }
     bed_music = _retry_once(
         lambda: ctx.workspace.download(
@@ -421,10 +408,13 @@ def validate_assemble_manifest(
             raise AssembleError(f"assemble: duplicate approved clip id {clip_id!r}")
         seen_ids.add(clip_id)
 
-        start_ms = parse_srt_timestamp(
-            _required_clip_string(clip, "start", index)
-        )
-        end_ms = parse_srt_timestamp(_required_clip_string(clip, "end", index))
+        start_text = _required_clip_string(clip, "start", index)
+        end_text = _required_clip_string(clip, "end", index)
+        try:
+            start_ms = parse_srt_timestamp(start_text)
+            end_ms = parse_srt_timestamp(end_text)
+        except CaptionError as exc:
+            raise AssembleError(str(exc)) from exc
         if end_ms <= start_ms:
             raise AssembleError(
                 f"assemble: clip {clip_id} end must be after start"
@@ -461,99 +451,48 @@ def validate_assemble_manifest(
     return data, srt_key, approved
 
 
-def parse_srt_timestamp(timestamp: str) -> int:
-    """Parse an SRT timestamp into integer milliseconds."""
-
-    match = SRT_TIMESTAMP_RE.fullmatch(timestamp)
-    if match is None:
-        raise AssembleError(f"assemble: invalid SRT timestamp {timestamp!r}")
-    hours = int(match.group("hours"))
-    minutes = int(match.group("minutes"))
-    seconds = int(match.group("seconds"))
-    milliseconds = int(match.group("milliseconds"))
-    if minutes >= 60 or seconds >= 60:
-        raise AssembleError(f"assemble: invalid SRT timestamp {timestamp!r}")
-    return (((hours * 60) + minutes) * 60 + seconds) * 1000 + milliseconds
-
-
-def parse_master_srt(content: bytes) -> dict[int, SrtBlock]:
-    """Parse master SRT structure while retaining each subtitle text verbatim."""
+def _clip_caption_bytes(
+    ctx: AssembleStageContext,
+    master_blocks: Sequence[Block],
+    clip: AssembleClip,
+) -> bytes:
+    """Return the clip's caption SRT, preferring a validated operator edit."""
 
     try:
-        text = content.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise AssembleError("assemble: master SRT must be valid UTF-8") from exc
-
-    payload = text.strip("\r\n")
-    if not payload:
-        raise AssembleError("assemble: master SRT has no subtitle blocks")
-
-    blocks: dict[int, SrtBlock] = {}
-    for position, chunk in enumerate(re.split(r"(?:\r\n|\n){2,}", payload), start=1):
-        match = SRT_BLOCK_RE.fullmatch(chunk)
-        if match is None:
-            raise AssembleError(
-                f"assemble: master SRT block at position {position} is malformed"
-            )
-        number = int(match.group("number"))
-        if number in blocks:
-            raise AssembleError(
-                f"assemble: master SRT contains duplicate block {number}"
-            )
-        blocks[number] = SrtBlock(
-            number=number,
-            start_ms=parse_srt_timestamp(match.group("start")),
-            end_ms=parse_srt_timestamp(match.group("end")),
-            text=match.group("text"),
+        generated = build_clip_srt(
+            master_blocks,
+            start_block=clip.start_block,
+            end_block=clip.end_block,
+            clip_start_ms=clip.start_ms,
+            clip_id=clip.clip_id,
         )
-    return blocks
+    except CaptionError as exc:
+        raise AssembleError(str(exc)) from exc
 
+    edited_key = edited_clip_caption_key(ctx.job.id, clip.clip_id)
+    if not _optional_object_exists(ctx, edited_key):
+        return generated
 
-def build_clip_srt(
-    blocks: Mapping[int, SrtBlock],
-    *,
-    start_block: int,
-    end_block: int,
-    clip_start_ms: int,
-    clip_id: str,
-) -> bytes:
-    """Slice, re-time, and renumber master blocks without changing their text."""
-
-    output: list[str] = []
-    for output_number, block_number in enumerate(
-        range(start_block, end_block + 1), start=1
-    ):
-        block = blocks.get(block_number)
-        if block is None:
-            raise AssembleError(
-                f"assemble: clip {clip_id} references missing master SRT "
-                f"block {block_number}"
-            )
-        shifted_start = block.start_ms - clip_start_ms
-        shifted_end = block.end_ms - clip_start_ms
-        if shifted_start < 0 or shifted_end < 0:
-            raise AssembleError(
-                f"assemble: clip {clip_id} block {block_number} shifts to "
-                "a negative subtitle timestamp"
-            )
-        output.append(
-            f"{output_number}\n"
-            f"{format_srt_timestamp(shifted_start)} --> "
-            f"{format_srt_timestamp(shifted_end)}\n"
-            f"{block.text}"
+    edited_path = _retry_once(
+        lambda: ctx.workspace.download(
+            edited_key, f"assemble/captions/{clip.clip_id}.edited.srt"
+        ),
+        description=f"edited captions download ({edited_key})",
+    )
+    try:
+        validated = validate_edited_slice(
+            generated, edited_path.read_bytes(), clip.clip_id
         )
-    return ("\n\n".join(output) + "\n").encode("utf-8")
-
-
-def format_srt_timestamp(milliseconds: int) -> str:
-    """Format non-negative milliseconds as an SRT timestamp."""
-
-    if milliseconds < 0:
-        raise ValueError("SRT milliseconds cannot be negative")
-    hours, remainder = divmod(milliseconds, 3_600_000)
-    minutes, remainder = divmod(remainder, 60_000)
-    seconds, millis = divmod(remainder, 1_000)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+    except ValueError as exc:
+        raise AssembleError(
+            f"assemble: clip {clip.clip_id} edited captions rejected: {exc}"
+        ) from exc
+    except CaptionError as exc:
+        raise AssembleError(str(exc)) from exc
+    logger.info(
+        "assemble[%s]: clip %s using edited captions", ctx.job.id, clip.clip_id
+    )
+    return format_clip_srt(validated)
 
 
 def build_library_segment_command(
@@ -1463,6 +1402,19 @@ def _head_required_object(
         raise AssembleError(
             f"assemble: required {description} missing or inaccessible: {s3_key}"
         ) from exc
+
+
+def _optional_object_exists(ctx: AssembleStageContext, s3_key: str) -> bool:
+    """True if an optional object exists; only a not-found reads as absent."""
+
+    try:
+        ctx.workspace.s3.head_object(Bucket=ctx.workspace.bucket, Key=s3_key)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
+    return True
 
 
 def _download_to(

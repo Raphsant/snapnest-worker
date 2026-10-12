@@ -10,7 +10,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
+from botocore.exceptions import ClientError
+
 from worker import jobs
+from worker.artifacts import edited_clip_caption_key
+from worker.captions import CaptionError, parse_clip_srt, transcript_text
 from worker.library import LibraryAsset, LibraryCatalog, format_for_prompt
 from worker.lint import lint_prompts
 
@@ -103,7 +107,7 @@ def run_creative(ctx: StageContext) -> None:
             )
             continue
         category = _required_clip_string(clip, "category")
-        transcript = _required_clip_string(clip, "transcript")
+        transcript = _clip_transcript(ctx, clip)
 
         try:
             package, response_size = _generate_clip_package(
@@ -430,6 +434,52 @@ def _required_clip_string(clip: Mapping[str, object], field: str) -> str:
             f"creative: clip {clip_id} field {field} must be a non-empty string"
         )
     return value
+
+
+# --------------------------------------------------------------------------- #
+# S3 (edited caption slice)
+# --------------------------------------------------------------------------- #
+
+
+def _clip_transcript(ctx: StageContext, clip: Mapping[str, object]) -> str:
+    """Return the operator-edited caption wording if present, else the manifest's."""
+
+    clip_id = _required_clip_string(clip, "id")
+    edited_key = edited_clip_caption_key(ctx.job.id, clip_id)
+    if not _optional_object_exists(ctx, edited_key):
+        return _required_clip_string(clip, "transcript")
+
+    edited_path = ctx.workspace.download(
+        edited_key, f"creative/{clip_id}.edited.srt"
+    )
+    try:
+        blocks = parse_clip_srt(edited_path.read_bytes())
+    except CaptionError as exc:
+        raise CreativeError(
+            f"creative: clip {clip_id} edited captions malformed: {exc}"
+        ) from exc
+    text = transcript_text(blocks)
+    if not text.strip():
+        raise CreativeError(
+            f"creative: clip {clip_id} edited captions have no text"
+        )
+    logger.info(
+        "creative[%s]: clip %s using edited transcript", ctx.job.id, clip_id
+    )
+    return text
+
+
+def _optional_object_exists(ctx: StageContext, s3_key: str) -> bool:
+    """True if an optional object exists; only a not-found reads as absent."""
+
+    try:
+        ctx.workspace.s3.head_object(Bucket=ctx.workspace.bucket, Key=s3_key)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
+    return True
 
 
 # --------------------------------------------------------------------------- #

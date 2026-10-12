@@ -11,11 +11,19 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from botocore.exceptions import ClientError
 from mypy_boto3_s3.client import S3Client
 from psycopg import Connection
 from psycopg.rows import DictRow
 
 from worker import jobs
+from worker.captions import (
+    Block,
+    CaptionError,
+    build_clip_srt,
+    format_clip_srt,
+    parse_master_srt,
+)
 from worker.jobs import Job
 from worker.library import LibraryCatalog
 from worker.stages import assemble
@@ -26,14 +34,12 @@ from worker.stages.assemble import (
     SilenceInterval,
     TextOverlay,
     build_audio_mux_command,
-    build_clip_srt,
     build_duration_probe_command,
     build_library_segment_command,
     build_main_caption_command,
     build_silence_cut_command,
     build_silence_detect_command,
     build_video_xfade_command,
-    parse_master_srt,
     run_assemble,
 )
 from worker.workspace import Workspace
@@ -50,6 +56,29 @@ MASTER_SRT = (
     b"\r\n"
     b"2\r\n"
     b"00:00:11,500 --> 00:00:12,500\r\n"
+    b"Texto final\r\n"
+)
+EDITED_CAPTIONS_KEY = f"pipeline/{JOB_ID}/clips/captions/{CLIP_ID}.edited.srt"
+# build_clip_srt output for _clip() (start 00:00:10,000, blocks 1-2): LF
+# separators, block text verbatim from the master (inner CRLF kept).
+CLIP_SLICE = (
+    b"1\n"
+    b"00:00:00,000 --> 00:00:01,250\n"
+    b"Primera l\xc3\xadnea\r\nsegunda l\xc3\xadnea\n"
+    b"\n"
+    b"2\n"
+    b"00:00:01,500 --> 00:00:02,500\n"
+    b"Texto final\n"
+)
+# Operator edit of CLIP_SLICE as a browser textarea returns it: block 1 text
+# changed, every line ending CRLF, timings untouched.
+EDITED_CLIP_SLICE = (
+    b"1\r\n"
+    b"00:00:00,000 --> 00:00:01,250\r\n"
+    b"Primera l\xc3\xadnea editada\r\nsegunda l\xc3\xadnea\r\n"
+    b"\r\n"
+    b"2\r\n"
+    b"00:00:01,500 --> 00:00:02,500\r\n"
     b"Texto final\r\n"
 )
 # Probed durations of the normalized segment FILES (never catalog nominals):
@@ -69,6 +98,8 @@ LIBRARY_KEYS = {
     "O02": "library/outros/O02.mp4",  # logo_baked False
 }
 TEXTFILE_RE = re.compile(r"textfile='([^']+)'")
+# The subtitles filename is _escape_filter_value'd: unescape \x -> x to read it.
+SUBTITLES_FILENAME_RE = re.compile(r"subtitles=filename='((?:\\.|[^'\\])*)'")
 # Any video dip-to-black: fade=t=... NOT preceded by 'a' (the audio end fade
 # afade=t=in must survive; xfade=transition=fade never matches this pattern).
 VIDEO_FADE_RE = re.compile(r"(?<!a)fade=t=")
@@ -117,7 +148,9 @@ class FakeS3:
         assert Bucket == BUCKET
         self.heads.append(Key)
         if Key not in self.objects:
-            raise FileNotFoundError(Key)
+            raise ClientError(
+                {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
+            )
 
     def download_file(self, bucket: str, key: str, filename: str) -> None:
         assert bucket == BUCKET
@@ -170,6 +203,7 @@ class Harness:
     ffmpeg_descriptions: list[str]
     probed_segments: list[str]
     overlay_textfile_bytes: dict[str, bytes]
+    subtitle_srt_bytes: dict[str, bytes]
 
     def run(self) -> None:
         with self.context.workspace:
@@ -320,15 +354,19 @@ def _harness(
     ffmpeg_descriptions: list[str] = []
     probed_segments: list[str] = []
     overlay_textfile_bytes: dict[str, bytes] = {}
+    subtitle_srt_bytes: dict[str, bytes] = {}
 
     def fake_ffmpeg(command: list[str], *, description: str) -> str:
         ffmpeg_commands.append(command)
         ffmpeg_descriptions.append(description)
-        # Capture temp textfile bytes while they still exist on disk.
+        # Capture temp textfile/SRT bytes while they still exist on disk.
         for argument in command:
             for textfile in TEXTFILE_RE.findall(argument):
                 path = Path(textfile)
                 overlay_textfile_bytes[path.name] = path.read_bytes()
+            for escaped in SUBTITLES_FILENAME_RE.findall(argument):
+                path = Path(re.sub(r"\\(.)", r"\1", escaped))
+                subtitle_srt_bytes[path.name] = path.read_bytes()
         if command[-1] != "-":
             Path(command[-1]).write_bytes(b"encoded mp4")
         return ""
@@ -348,6 +386,7 @@ def _harness(
         ffmpeg_descriptions=ffmpeg_descriptions,
         probed_segments=probed_segments,
         overlay_textfile_bytes=overlay_textfile_bytes,
+        subtitle_srt_bytes=subtitle_srt_bytes,
     )
 
 
@@ -367,7 +406,7 @@ def test_master_srt_slice_preserves_text_and_retimes_blocks() -> None:
         clip_id=CLIP_ID,
     )
 
-    assert blocks[1].text.encode("utf-8") == (
+    assert blocks[0].text.encode("utf-8") == (
         b"Primera l\xc3\xadnea\r\nsegunda l\xc3\xadnea"
     )
     assert result == (
@@ -384,7 +423,7 @@ def test_master_srt_slice_preserves_text_and_retimes_blocks() -> None:
 def test_master_srt_slice_rejects_negative_shift() -> None:
     blocks = parse_master_srt(MASTER_SRT)
 
-    with pytest.raises(AssembleError, match="negative subtitle timestamp"):
+    with pytest.raises(CaptionError, match="negative subtitle timestamp"):
         build_clip_srt(
             blocks,
             start_block=1,
@@ -397,7 +436,7 @@ def test_master_srt_slice_rejects_negative_shift() -> None:
 def test_master_srt_slice_rejects_missing_block() -> None:
     blocks = parse_master_srt(MASTER_SRT)
 
-    with pytest.raises(AssembleError, match="missing master SRT block 3"):
+    with pytest.raises(CaptionError, match="missing master SRT block 3"):
         build_clip_srt(
             blocks,
             start_block=2,
@@ -906,6 +945,80 @@ def test_success_with_empty_overlay_fields_produces_no_drawtext(
         for argument in command
     )
     assert harness.overlay_textfile_bytes == {}
+
+
+def test_edited_captions_burned_when_text_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    harness = _harness(monkeypatch, tmp_path, _manifest())
+    harness.s3.objects[EDITED_CAPTIONS_KEY] = EDITED_CLIP_SLICE
+
+    with caplog.at_level(logging.INFO):
+        harness.run()
+
+    # Re-serialised by the one serialiser: LF everywhere, edited text,
+    # pipeline-owned timings -- never the raw CRLF edit bytes.
+    expected = format_clip_srt(
+        [
+            Block(
+                index=1,
+                start_ms=0,
+                end_ms=1_250,
+                text="Primera línea editada\nsegunda línea",
+            ),
+            Block(index=2, start_ms=1_500, end_ms=2_500, text="Texto final"),
+        ]
+    )
+    assert b"\r" not in expected
+    assert harness.subtitle_srt_bytes == {f"{CLIP_ID}.srt": expected}
+    assert any(
+        "using edited captions" in record.getMessage()
+        and CLIP_ID in record.getMessage()
+        for record in caplog.records
+    )
+    assert isinstance(_approved_clip(harness.db.manifest)["assembled"], dict)
+
+
+def test_edited_captions_with_moved_timestamp_are_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = _harness(monkeypatch, tmp_path, _manifest())
+    harness.s3.objects[EDITED_CAPTIONS_KEY] = EDITED_CLIP_SLICE.replace(
+        b"00:00:01,500 --> ", b"00:00:01,501 --> "
+    )
+
+    with pytest.raises(AssembleError) as raised:
+        harness.run()
+
+    message = str(raised.value)
+    assert "edited captions rejected" in message
+    assert CLIP_ID in message
+    assert harness.ffmpeg_commands == []
+    assert harness.db.checkpoints == []
+    assert harness.s3.uploads == []
+    assert "assembled" not in _approved_clip(harness.db.manifest)
+
+
+def test_absent_edited_captions_burn_generated_slice(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    harness = _harness(monkeypatch, tmp_path, _manifest())
+
+    with caplog.at_level(logging.INFO):
+        harness.run()
+
+    assert EDITED_CAPTIONS_KEY in harness.s3.heads
+    assert EDITED_CAPTIONS_KEY not in harness.s3.downloads
+    assert harness.subtitle_srt_bytes == {f"{CLIP_ID}.srt": CLIP_SLICE}
+    assert not any(
+        "using edited captions" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 # --------------------------------------------------------------------------- #

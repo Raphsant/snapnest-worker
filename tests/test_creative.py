@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from botocore.exceptions import ClientError
 from mypy_boto3_s3.client import S3Client
 from psycopg import Connection
 from psycopg.rows import DictRow
@@ -279,9 +280,38 @@ def test_validate_creative_manifest_rejects_invalid_inputs(
 # --------------------------------------------------------------------------- #
 
 
+EDITED_KEY = "pipeline/job-1/clips/captions/clip_01.edited.srt"
+# A valid clip-relative SRT whose wording differs from the manifest transcript.
+EDITED_SRT = (
+    b"1\n"
+    b"00:00:00,000 --> 00:00:01,250\n"
+    b"Hoy hablamos de PALOMITAS\n"
+    b"\n"
+    b"2\n"
+    b"00:00:01,500 --> 00:00:02,500\n"
+    b"y del proceso.\n"
+)
+
+
 class _FakeS3:
     def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.heads: list[str] = []
+        self.downloads: list[str] = []
         self.uploads: dict[str, bytes] = {}
+
+    def head_object(self, *, Bucket: str, Key: str) -> None:
+        self.heads.append(Key)
+        if Key not in self.objects:
+            raise ClientError(
+                {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
+            )
+
+    def download_file(self, bucket: str, key: str, filename: str) -> None:
+        self.downloads.append(key)
+        destination = Path(filename)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(self.objects[key])
 
     def upload_file(self, filename: str, bucket: str, key: str) -> None:
         self.uploads[key] = Path(filename).read_bytes()
@@ -457,13 +487,15 @@ def _run_creative_with_messages(
     *,
     manifest: dict[str, Any],
     texts: list[str],
+    objects: Mapping[str, bytes] | None = None,
 ) -> tuple[dict[str, Any], _FakeMessages, _FakeS3]:
     """Run the stage against a canned Anthropic transcript; capture the save.
 
     Unlike _run_creative_capture this keeps the real _generate_clip_package, so
     the user message (and therefore the availability block) is observable.
     An empty ``texts`` list means "no model call is expected" — an unexpected
-    create() pops from an empty list and fails the test loudly.
+    create() pops from an empty list and fails the test loudly. ``objects``
+    seeds the fake S3 before the run.
     """
 
     saved = _patch_common(monkeypatch)
@@ -474,6 +506,7 @@ def _run_creative_with_messages(
     )
 
     ctx, fake_s3, workspace = _make_ctx(tmp_path, manifest)
+    fake_s3.objects.update(objects or {})
     with workspace:
         run_creative(cast(StageContext, ctx))
     # KeyError here would itself mean the gate save never ran.
@@ -687,3 +720,91 @@ def test_run_creative_extension_run_processes_only_the_new_clip(
         "H02",
         "O02",
     )
+
+
+# --------------------------------------------------------------------------- #
+# run_creative: operator-edited caption slice
+# --------------------------------------------------------------------------- #
+
+
+def test_run_creative_prompts_with_edited_transcript(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("INFO", logger="worker.stages.creative"):
+        saved, fake_messages, fake_s3 = _run_creative_with_messages(
+            monkeypatch,
+            tmp_path,
+            manifest=_approved_manifest(),
+            texts=[json.dumps(_package())],
+            objects={EDITED_KEY: EDITED_SRT},
+        )
+
+    assert fake_s3.downloads == [EDITED_KEY]
+    assert len(fake_messages.calls) == 1
+    user = fake_messages.calls[0]["messages"][0]["content"]
+    assert "PALOMITAS" in user
+    assert "Algo importante dijo Eduardo." not in user
+    # The edit feeds the prompt only; the manifest field is never rewritten.
+    assert saved["clips"][0]["transcript"] == "Algo importante dijo Eduardo."
+    assert "clip clip_01 using edited transcript" in caplog.text
+
+
+def test_run_creative_rejects_malformed_edited_captions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(CreativeError) as raised:
+        _run_creative_with_messages(
+            monkeypatch,
+            tmp_path,
+            manifest=_approved_manifest(),
+            texts=[],
+            objects={EDITED_KEY: b"this is not an srt\n"},
+        )
+
+    message = str(raised.value)
+    assert "edited captions malformed" in message
+    assert "clip_01" in message
+
+
+def test_run_creative_rejects_edited_captions_with_no_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Every block blanked: structurally valid, but nothing to prompt with.
+    all_blank = (
+        b"1\n"
+        b"00:00:00,000 --> 00:00:01,250\n"
+        b"\n"
+        b"2\n"
+        b"00:00:01,500 --> 00:00:02,500\n"
+    )
+
+    with pytest.raises(CreativeError, match="have no text"):
+        _run_creative_with_messages(
+            monkeypatch,
+            tmp_path,
+            manifest=_approved_manifest(),
+            texts=[],
+            objects={EDITED_KEY: all_blank},
+        )
+
+
+def test_run_creative_done_clip_never_checks_for_edited_captions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    saved, fake_messages, fake_s3 = _run_creative_with_messages(
+        monkeypatch,
+        tmp_path,
+        manifest={"status": "approved", "clips": [_done_clip()]},
+        texts=[],
+        objects={EDITED_KEY: EDITED_SRT},
+    )
+
+    assert fake_messages.calls == []
+    assert fake_s3.heads == []
+    assert fake_s3.downloads == []
+    assert saved["clips"][0]["transcript"] == "Algo importante dijo Eduardo."
