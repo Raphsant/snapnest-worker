@@ -1411,6 +1411,12 @@ def _optional_object_exists(ctx: AssembleStageContext, s3_key: str) -> bool:
         ctx.workspace.s3.head_object(Bucket=ctx.workspace.bucket, Key=s3_key)
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code")
+        if code in {"403", "AccessDenied"}:
+            raise AssembleError(
+                f"assemble: S3 HEAD on {s3_key} returned 403; the worker IAM "
+                "user needs s3:ListBucket on the bucket so missing keys "
+                "return 404"
+            ) from exc
         if code in {"404", "NoSuchKey", "NotFound"}:
             return False
         raise
